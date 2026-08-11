@@ -12,9 +12,13 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import smtplib
 from email.header import Header
+from email.mime.application import MIMEApplication
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr
 from pathlib import Path
@@ -72,6 +76,7 @@ def send_email(
     body: str,
     config: dict[str, Any] | None = None,
     html: bool = False,
+    attachments: list[Path | str] | None = None,
 ) -> dict[str, Any]:
     """发送一封邮件; 失败抛出异常。日志不回显授权码。"""
     cfg = config or load_email_config()
@@ -81,7 +86,21 @@ def send_email(
     auth_code = str(cfg["auth_code"])
     recipients = [str(r) for r in cfg["recipients"]]
 
-    msg = MIMEText(body, "html" if html else "plain", "utf-8")
+    if attachments:
+        msg = MIMEMultipart("mixed")
+        msg.attach(MIMEText(body, "html" if html else "plain", "utf-8"))
+        for att in attachments:
+            att_path = Path(att)
+            ctype, _ = mimetypes.guess_type(str(att_path))
+            maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
+            if maintype == "image":
+                part: Any = MIMEImage(att_path.read_bytes(), _subtype=subtype)
+            else:
+                part = MIMEApplication(att_path.read_bytes(), _subtype=subtype)
+            part.add_header("Content-Disposition", "attachment", filename=att_path.name)
+            msg.attach(part)
+    else:
+        msg = MIMEText(body, "html" if html else "plain", "utf-8")
     msg["Subject"] = Header(subject, "utf-8")
     msg["From"] = formataddr((str(cfg.get("sender_name", "QuantTrader Auto")), sender))
     msg["To"] = ", ".join(recipients)

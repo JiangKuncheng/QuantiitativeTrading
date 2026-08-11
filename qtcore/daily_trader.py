@@ -31,6 +31,7 @@ from qtcore.backtest.engine import BacktestEngine
 from qtcore.config import AppConfig
 from qtcore.datacenter.data_center import DataCenter
 from qtcore.emailer import load_email_config, send_email
+from qtcore.holdings_chart import build_daily_chart
 from qtcore.report_writer import (
     write_daily_report,
     write_incident_report,
@@ -417,6 +418,18 @@ class DailyTrader:
         tomorrow_plan = self._save_tomorrow_plan(today, params, targets, holdings, halted)
         self.store.log_run(d_iso, "daily", "ok", f"equity={today_equity:.2f}")
 
+        # 生成日报附件图: 左持仓饼图 + 右收益折线
+        chart_path: Path | None = None
+        try:
+            chart_path = build_daily_chart(
+                db_path=self.store.path,
+                cache_dir=self.app.paths.cache_dir,
+                out_path=self.app.paths.output_dir / f"daily_chart_{d_str}.png",
+            )
+            print(f"[Daily] 日报图表已生成: {chart_path}")
+        except Exception as exc:
+            print(f"[Daily] 日报图表生成失败(不影响日报): {exc!r}")
+
         # 4) 日报
         daily_data = {
             "date": d_iso,
@@ -439,7 +452,12 @@ class DailyTrader:
         }
         body = write_daily_report(daily_data)
         subject = f"[QuantTrader] 日报 {d_iso}"
-        send_email(subject, body, config=self.email_cfg)
+        send_email(
+            subject,
+            body,
+            config=self.email_cfg,
+            attachments=[chart_path] if chart_path else None,
+        )
         self.store.save_report(d_iso, "daily", subject, body)
         print(f"[Daily] 日报已发送: {subject}")
 

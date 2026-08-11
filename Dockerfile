@@ -8,7 +8,7 @@ WORKDIR /app
 
 # timezone data + cron (for daily scheduled trading)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata cron \
+    && apt-get install -y --no-install-recommends tzdata cron fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # install dependencies first (leverage docker layer cache)
