@@ -212,15 +212,35 @@ class DailyTrader:
     # ------------------------------------------------------------------
     # 主流程
     # ------------------------------------------------------------------
-    def run(self, run_date: str | None = None, force_weekly: bool = False, force_monthly: bool = False) -> dict[str, Any]:
+    def run(
+        self,
+        run_date: str | None = None,
+        force_weekly: bool = False,
+        force_monthly: bool = False,
+        settle_retries: int = 20,
+        settle_retry_interval: int = 15,
+    ) -> dict[str, Any]:
         today = datetime.strptime(run_date, "%Y%m%d").date() if run_date else date.today()
         d_str = today.strftime("%Y%m%d")
         d_iso = today.strftime("%Y-%m-%d")
-        try:
-            return self._run_inner(today, d_str, d_iso, force_weekly, force_monthly)
-        except Exception as exc:
-            self._handle_incident(today, "daily_run", exc)
-            raise
+        for attempt in range(settle_retries + 1):
+            try:
+                return self._run_inner(today, d_str, d_iso, force_weekly, force_monthly)
+            except RuntimeError as exc:
+                # 当日行情未发布是常见情况(新浪/腾讯收盘后一两个小时才出当日日线),
+                # 自动等待重试, 数据一到即出日报; 超过重试上限才发突发告警
+                if "行情数据未发布" in str(exc) and attempt < settle_retries:
+                    print(
+                        f"[Daily] 当日行情未发布, 第 {attempt + 1}/{settle_retries} 次等待, "
+                        f"{settle_retry_interval} 分钟后重试..."
+                    )
+                    time.sleep(settle_retry_interval * 60)
+                    continue
+                self._handle_incident(today, "daily_run", exc)
+                raise
+            except Exception as exc:
+                self._handle_incident(today, "daily_run", exc)
+                raise
 
     def _run_inner(self, today: date, d_str: str, d_iso: str, force_weekly: bool, force_monthly: bool) -> dict[str, Any]:
         if not self.is_trading_day(today):

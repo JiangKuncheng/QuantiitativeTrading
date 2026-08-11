@@ -30,6 +30,10 @@ def main() -> int:
     parser.add_argument("--execute", action="store_true", help="9:20 执行当日计划(实时成交)")
     parser.add_argument("--retries", type=int, default=5, help="开盘价获取失败后的重试次数(默认5)")
     parser.add_argument("--retry-interval", type=int, default=10, help="重试间隔分钟(默认10)")
+    parser.add_argument("--settle-retries", type=int, default=20,
+                        help="结算时当日行情未发布的最大等待重试次数(默认20)")
+    parser.add_argument("--settle-retry-interval", type=int, default=15,
+                        help="结算等待重试间隔分钟(默认15, 最多等到约21点)")
     parser.add_argument("--date", default=None, help="指定日期 YYYYMMDD(回补用)")
     parser.add_argument("--weekly", action="store_true", help="强制发送周报")
     parser.add_argument("--monthly", action="store_true", help="强制发送月报")
@@ -64,6 +68,8 @@ def main() -> int:
         run_date=args.date,
         force_weekly=args.weekly,
         force_monthly=args.monthly,
+        settle_retries=args.settle_retries,
+        settle_retry_interval=args.settle_retry_interval,
     )
     if not result.get("trading_day"):
         print("非交易日, 未执行交易/报告")
