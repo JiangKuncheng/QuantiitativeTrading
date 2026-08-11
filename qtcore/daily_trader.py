@@ -17,6 +17,7 @@ DailyTrader 每日自动交易与报告
 from __future__ import annotations
 
 import json
+import time
 import traceback
 from dataclasses import replace
 from datetime import date, datetime, timedelta
@@ -36,11 +37,13 @@ from qtcore.report_writer import (
     write_monthly_report,
     write_weekly_report,
 )
+from qtcore.realtime import get_realtime_price
 from qtcore.store import Store
 from qtcore.strategy import create_strategy
 
 
 ROOT = Path(__file__).resolve().parent.parent
+HALT_STATE_PATH = ROOT / "data" / "halt_state.json"
 
 
 class DailyTrader:
@@ -198,6 +201,14 @@ class DailyTrader:
         bt.halt_resume_drawdown = float(params.get("halt_resume_drawdown", bt.halt_resume_drawdown))
         return bt
 
+    def _signal_bt_config(self, params: dict[str, Any]):
+        """信号/持仓回放配置: 关闭历史熔断(账户层熔断单独判断, 不套历史回撤)。"""
+        bt = self._bt_config(params)
+        bt.max_drawdown_halt = 0.0
+        bt.halt_cooldown_days = 0
+        bt.halt_resume_drawdown = 0.0
+        return bt
+
     # ------------------------------------------------------------------
     # 主流程
     # ------------------------------------------------------------------
@@ -241,7 +252,7 @@ class DailyTrader:
                     timeframe=timeframe,
                 )
                 strategy = create_strategy("ma_cross", params)
-                result = BacktestEngine(self._bt_config(params)).run(bars, strategy)
+                result = BacktestEngine(self._signal_bt_config(params)).run(bars, strategy)
 
                 eq = result.equity_curve
                 returns[code] = eq["daily_return"]
@@ -348,6 +359,13 @@ class DailyTrader:
                         }
                     )
             today_trades = build_trades
+            # 持仓口径与账户一致: 用实际建仓股数覆盖回测口径
+            for t in build_trades:
+                code = t["code"]
+                if code in holdings:
+                    holdings[code]["units"] = t["units"]
+                    holdings[code]["last_close"] = t["price"]
+                    holdings[code]["value"] = round(t["units"] * t["price"], 2)
             today_equity = float(self.cfg["initial_capital"])
             prev_equity = today_equity
             daily_return = 0.0
@@ -366,8 +384,12 @@ class DailyTrader:
                 "benchmark_total": round(benchmark_total, 6),
             }
         )
+        # 账户层熔断状态机(基于建仓以来的权益链, 不套历史回撤)
+        halted = self._account_halt_check(today, d_iso, params)
         self.store.save_trades(today_trades)
         self.store.save_signals(d_iso, targets, params)
+        # 生成明日交易计划(供次日 9:20 执行 / 模拟模式 16:00 回放)
+        tomorrow_plan = self._save_tomorrow_plan(today, params, targets, holdings, halted)
         self.store.log_run(d_iso, "daily", "ok", f"equity={today_equity:.2f}")
 
         # 4) 日报
@@ -385,6 +407,7 @@ class DailyTrader:
             "trades_today": today_trades,
             "holdings": holdings,
             "signals": targets,
+            "tomorrow_plan": tomorrow_plan,
             "data_failed": failed,
             "note": "账户从 account_start 起新建仓; 建仓日按收盘信号建仓、当日盈亏记0, 次日开始计收益",
         }
@@ -409,6 +432,242 @@ class DailyTrader:
             "trades": len(today_trades),
             "failed_symbols": failed,
         }
+
+    def _save_tomorrow_plan(
+        self,
+        today: date,
+        params: dict[str, Any],
+        targets: dict[str, int],
+        holdings: dict[str, dict[str, Any]],
+        halted: bool = False,
+    ) -> list[dict[str, Any]]:
+        """根据今日收盘信号生成明日交易计划并入库; 熔断期间只生成清仓计划。"""
+        nxt = self.next_trading_day(today)
+        if nxt is None:
+            return []
+        nxt_iso = nxt.strftime("%Y-%m-%d")
+        plans: list[dict[str, Any]] = []
+        if halted:
+            # 熔断: 次日全部清仓, 不再开新仓
+            for code, held in holdings.items():
+                plans.append(
+                    {
+                        "date": nxt_iso,
+                        "code": code,
+                        "action": "SELL",
+                        "units": held["units"],
+                        "params": json.dumps(params, ensure_ascii=False),
+                    }
+                )
+        else:
+            for code, tgt in targets.items():
+                held = holdings.get(code)
+                if tgt == 1:
+                    action = "HOLD" if held else "BUY"
+                    plans.append(
+                        {
+                            "date": nxt_iso,
+                            "code": code,
+                            "action": action,
+                            "units": held["units"] if held else None,
+                            "params": json.dumps(params, ensure_ascii=False),
+                        }
+                    )
+                elif tgt == 0 and held:
+                    plans.append(
+                        {
+                            "date": nxt_iso,
+                            "code": code,
+                            "action": "SELL",
+                            "units": held["units"],
+                            "params": json.dumps(params, ensure_ascii=False),
+                        }
+                    )
+        self.store.save_plans(nxt_iso, plans)
+        print(f"[Daily] 明日计划已生成({nxt_iso}): {[(p['code'], p['action']) for p in plans]}")
+        return plans
+
+    def _account_halt_check(
+        self,
+        today: date,
+        d_iso: str,
+        params: dict[str, Any],
+    ) -> bool:
+        """
+        账户层熔断状态机: 用"建仓以来"的账户权益链计算回撤,
+        触发 -> 冷却 -> 恢复, 状态存 data/halt_state.json。
+        """
+        halt_limit = float(params.get("max_drawdown_halt", 0.0))
+        resume_limit = float(params.get("halt_resume_drawdown", 0.0))
+        cooldown = int(params.get("halt_cooldown_days", 0))
+        if halt_limit <= 0:
+            return False
+
+        acc_start = str(self.cfg.get("account_start", d_iso))
+        acc_start_iso = f"{acc_start[:4]}-{acc_start[4:6]}-{acc_start[6:]}"
+        eq_rows = self.store.equity_between(acc_start_iso, d_iso)
+        if len(eq_rows) < 2:
+            return False
+        eqs = [r["equity"] for r in eq_rows]
+        peak = max(eqs)
+        dd = eqs[-1] / peak - 1.0 if peak > 0 else 0.0
+
+        state: dict[str, Any] = {}
+        if HALT_STATE_PATH.exists():
+            try:
+                state = json.loads(HALT_STATE_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                state = {}
+
+        if state.get("halted"):
+            cooldown_until = str(state.get("cooldown_until", ""))
+            recovered = resume_limit <= 0 or dd > -abs(resume_limit)
+            if d_iso >= cooldown_until and recovered:
+                HALT_STATE_PATH.unlink(missing_ok=True)
+                print(f"[Daily] {d_iso} 账户熔断解除(回撤 {dd:.2%} 回到阈值内)")
+                return False
+            print(f"[Daily] {d_iso} 账户熔断中(回撤 {dd:.2%}, 冷却至 {cooldown_until}), 次日计划=清仓")
+            return True
+
+        if dd <= -abs(halt_limit):
+            cooldown_until = d_iso
+            for _ in range(max(cooldown, 1)):
+                nxt = self.next_trading_day(
+                    datetime.strptime(cooldown_until, "%Y-%m-%d").date()
+                )
+                cooldown_until = nxt.strftime("%Y-%m-%d") if nxt else cooldown_until
+            HALT_STATE_PATH.write_text(
+                json.dumps(
+                    {
+                        "halted": True,
+                        "halted_since": d_iso,
+                        "cooldown_until": cooldown_until,
+                        "drawdown": round(dd, 6),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print(f"[Daily] {d_iso} 触发账户熔断: 回撤 {dd:.2%}, 次日计划=清仓")
+            return True
+        return False
+
+    def execute_plan(
+        self,
+        run_date: str | None = None,
+        wait_minutes: int = 15,
+    ) -> dict[str, Any]:
+        """
+        9:20 执行任务(两步):
+          Step 1: 读取昨日收盘生成的当日计划(plans 表);
+          Step 2: 等到开盘价确定后(9:25 集合竞价结束)成交; 最长等 wait_minutes 分钟,
+                  仍拿不到开盘价则发突发告警, 不瞎成交。
+        - simulation 模式: 计划由 16:00 结算回放执行, 此处只展示不成交;
+        - realtime 模式: 拉实时价成交, 拿不到实时价则发突发告警。
+        """
+        today = datetime.strptime(run_date, "%Y%m%d").date() if run_date else date.today()
+        d_iso = today.strftime("%Y-%m-%d")
+        if not self.is_trading_day(today):
+            print(f"[Execute] {d_iso} 非交易日, 跳过")
+            return {"executed": False, "reason": "non_trading"}
+
+        plans = self.store.load_plans(d_iso)
+        if not plans:
+            print(f"[Execute] {d_iso} 无交易计划(可能 16:00 结算尚未生成)")
+            return {"executed": False, "reason": "no_plan"}
+
+        mode = str(self.cfg.get("execution_mode", "simulation"))
+        if mode == "simulation":
+            print(f"[Execute] {d_iso} 模拟模式: 计划由 16:00 结算回放执行, 此处不成交:")
+            for p in plans:
+                print(f"  {p['code']} {p['action']} units={p['units']}")
+            return {"executed": False, "reason": "simulation_mode", "plans": plans}
+
+        # realtime 模式: 两步执行
+        needed = [p for p in plans if p["action"] != "HOLD"]
+        if not needed:
+            print(f"[Execute] {d_iso} 计划全部为 HOLD, 今日无需成交")
+            return {"executed": False, "reason": "no_action", "plans": plans}
+
+        # Step 2: 等到开盘价可用后成交(9:25 集合竞价结束, 轮询最长 wait_minutes 分钟)
+        print(f"[Execute] {d_iso} 等待开盘价(最长 {wait_minutes} 分钟)...")
+        got, missing = self._wait_open_prices(
+            [p["code"] for p in needed],
+            wait_minutes=wait_minutes,
+        )
+        if missing:
+            self._handle_incident(
+                today,
+                "execute_plan",
+                RuntimeError(f"开盘价不可用, 以下标的无法成交: {missing}"),
+            )
+            return {"executed": False, "reason": "realtime_unavailable", "missing": missing}
+
+        params = dict(self.cfg["strategy"]["params"])
+        bt_cfg = self._bt_config(params)
+        prev_equity = self.store.prev_equity_before(d_iso) or float(self.cfg["initial_capital"])
+        buys = [p for p in needed if p["action"] == "BUY"]
+        budget_each = prev_equity * bt_cfg.position_ratio / max(len(buys), 1)
+        fills: list[dict[str, Any]] = []
+
+        for p in needed:
+            price = got[p["code"]]
+            if p["action"] == "BUY":
+                units = int(budget_each / (price * self.app.backtest.lot_size)) * self.app.backtest.lot_size
+            else:
+                units = int(p.get("units") or 0)
+            if units <= 0:
+                continue
+            fills.append(
+                {
+                    "date": d_iso,
+                    "code": p["code"],
+                    "name": self._names.get(p["code"], p["code"]),
+                    "side": "BUY" if p["action"] == "BUY" else "SELL",
+                    "units": units,
+                    "price": round(price, 3),
+                    "commission": round(units * price * bt_cfg.commission_rate, 4),
+                    "pnl": None,
+                    "reason": "plan_execute",
+                }
+            )
+
+        if fills:
+            self.store.save_trades(fills)
+        print(f"[Execute] {d_iso} 成交 {len(fills)} 笔(实时行情)")
+        for f in fills:
+            print(f"  {f['code']} {f['side']} {f['units']}股 @ {f['price']}")
+        return {"executed": True, "fills": len(fills), "prices": {k: round(v, 3) for k, v in got.items()}}
+
+    def _wait_open_prices(
+        self,
+        codes: list[str],
+        wait_minutes: int = 15,
+        interval: int = 30,
+    ) -> tuple[dict[str, float], list[str]]:
+        """
+        轮询等待开盘价: 北京时间 9:26 之后(9:25 集合竞价结束)才开始取价,
+        全部拿到返回 (prices, []); 超时返回 (已有, 缺失列表)。
+        """
+        deadline = time.time() + max(wait_minutes, 0) * 60
+        got: dict[str, float] = {}
+        while time.time() < deadline:
+            now = datetime.now()
+            after_open = (now.hour, now.minute) >= (9, 26)  # 集合竞价结束, 开盘价确定
+            if after_open:
+                for code in codes:
+                    if code in got:
+                        continue
+                    quote = get_realtime_price(code)
+                    if quote is not None:
+                        got[code] = float(quote["price"])
+                if len(got) == len(codes):
+                    print(f"[Execute] 开盘价就绪: {got}")
+                    return got, []
+            time.sleep(interval)
+        missing = [c for c in codes if c not in got]
+        return got, missing
 
     # ------------------------------------------------------------------
     # 周报 / 月报

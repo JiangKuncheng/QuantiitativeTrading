@@ -26,6 +26,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="run_daily", description="每日自动交易与报告")
     parser.add_argument("--test-email", action="store_true", help="发送测试邮件")
     parser.add_argument("--today", action="store_true", help="运行今天完整流程")
+    parser.add_argument("--settle", action="store_true", help="16:00 结算+日报+生成明日计划")
+    parser.add_argument("--execute", action="store_true", help="9:20 执行当日计划(实时成交)")
+    parser.add_argument("--wait-minutes", type=int, default=15,
+                        help="等待开盘价的最长分钟数(默认15, 9:20 起约 9:35 截止)")
     parser.add_argument("--date", default=None, help="指定日期 YYYYMMDD(回补用)")
     parser.add_argument("--weekly", action="store_true", help="强制发送周报")
     parser.add_argument("--monthly", action="store_true", help="强制发送月报")
@@ -44,10 +48,14 @@ def main() -> int:
         print(f"测试邮件已发送: {info['subject']} -> {info['to']}")
         return 0
 
-    if not (args.today or args.date):
-        parser.error("请指定 --test-email 或 --today/--date")
+    if not (args.today or args.settle or args.execute or args.date):
+        parser.error("请指定 --test-email 或 --settle/--execute/--today/--date")
 
     trader = DailyTrader(db_path=args.db)
+    if args.execute:
+        result = trader.execute_plan(run_date=args.date, wait_minutes=args.wait_minutes)
+        print(result)
+        return 0
     result = trader.run(
         run_date=args.date,
         force_weekly=args.weekly,

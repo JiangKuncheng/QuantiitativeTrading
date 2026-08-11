@@ -3,6 +3,7 @@
   "data_start": "20200101",
   "account_start": "20260810",
   "timeframe": "daily",
+  "execution_mode": "simulation",
   "pool": {"source": "csi300", "size": 15},
   "benchmark": "000300",
   "strategy": {

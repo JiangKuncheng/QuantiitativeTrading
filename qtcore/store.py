@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS signals (
     params TEXT,
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    code TEXT NOT NULL,
+    action TEXT NOT NULL,
+    units INTEGER,
+    params TEXT,
+    created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,
@@ -193,6 +202,32 @@ class Store:
                 ),
             )
         self.conn.commit()
+
+    def save_plans(self, date: str, plans: list[dict[str, Any]]) -> None:
+        """保存某交易日的计划(先清后写, 可重跑)。"""
+        self.conn.execute("DELETE FROM plans WHERE date = ?", (date,))
+        self.conn.executemany(
+            "INSERT INTO plans (date, code, action, units, params, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    date,
+                    p["code"],
+                    p["action"],
+                    p.get("units"),
+                    p.get("params", ""),
+                    datetime.now().isoformat(timespec="seconds"),
+                )
+                for p in plans
+            ],
+        )
+        self.conn.commit()
+
+    def load_plans(self, date: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM plans WHERE date = ? ORDER BY code",
+            (date,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def save_state(
         self,
