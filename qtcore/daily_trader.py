@@ -341,10 +341,14 @@ class DailyTrader:
         bench_df = self.dc.get_index_daily(
             str(self.cfg.get("benchmark", "000300")), self.cfg["data_start"], d_str
         )
+        # 基准指数仅用于日报对比, 若数据源延迟则降级为最近可用数据并注明, 不阻塞结算
+        benchmark_note = ""
         if bench_df.index[-1].strftime("%Y-%m-%d") < d_iso:
-            raise RuntimeError(
-                f"基准指数数据未更新到今日: 最新 {bench_df.index[-1].strftime('%Y-%m-%d')}"
+            benchmark_note = (
+                f"基准指数最新数据为 {bench_df.index[-1].strftime('%Y-%m-%d')}"
+                f"(未更新到今日), 大盘对比使用最近可用数据"
             )
+            print(f"[Daily] 警告: {benchmark_note}")
         bench_close = bench_df["close"].reindex(port_ret.index).ffill()
         bench_ret = bench_close.pct_change()
         benchmark_return = float(bench_ret.iloc[-1]) if not np.isnan(bench_ret.iloc[-1]) else 0.0
@@ -425,6 +429,7 @@ class DailyTrader:
             "benchmark_return_today": f"{benchmark_return:.2%}",
             "cumulative_return_since_start": f"{strategy_total:.2%}",
             "benchmark_since_start": f"{benchmark_total:.2%}",
+            "benchmark_note": benchmark_note,
             "trades_today": today_trades,
             "holdings": holdings,
             "signals": targets,
