@@ -17,14 +17,25 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib import font_manager
 
 
-plt.rcParams["font.sans-serif"] = [
-    "Noto Sans CJK SC",
-    "Microsoft YaHei",
-    "SimHei",
-    "DejaVu Sans",
-]
+_CJK_FONTS = ("Noto Sans CJK SC", "Microsoft YaHei", "SimHei")
+
+
+def _cjk_available() -> bool:
+    """检测系统是否有可用的中文字体(容器内通常没有, 自动切英文标签)。"""
+    for name in _CJK_FONTS:
+        try:
+            font_manager.findfont(name, fallback_to_default=False)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+_USE_CN = _cjk_available()
+plt.rcParams["font.sans-serif"] = list(_CJK_FONTS) + ["DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
 
@@ -109,10 +120,12 @@ def build_daily_chart(
 
     # 左侧: 持仓饼图
     if len(holdings_df):
-        labels = [
-            f"{r['name']} {r['code']}\n{r['value']:,.0f}元"
-            for r in holdings_df.to_dict("records")
-        ]
+        labels = []
+        for r in holdings_df.to_dict("records"):
+            if _USE_CN:
+                labels.append(f"{r['name']} {r['code']}\n{r['value']:,.0f}元")
+            else:
+                labels.append(f"{r['code']}\n{r['value']:,.0f} CNY")
         ax1.pie(
             holdings_df["value"],
             labels=labels,
@@ -120,30 +133,44 @@ def build_daily_chart(
             startangle=90,
             textprops={"fontsize": 9},
         )
-        ax1.set_title("当前持仓分布", fontsize=13)
+        ax1.set_title("当前持仓分布" if _USE_CN else "Holdings Distribution", fontsize=13)
     else:
         ax1.text(0.5, 0.5, "当前无持仓", ha="center", va="center", fontsize=13)
-        ax1.set_title("当前持仓分布", fontsize=13)
+        ax1.set_title("当前持仓分布" if _USE_CN else "Holdings Distribution", fontsize=13)
 
     # 右侧: 收益折线
-    ax2.plot(eq["date"], eq["equity"], label="策略账户", color="#2f6fbf", linewidth=2)
+    ax2.plot(
+        eq["date"],
+        eq["equity"],
+        label="策略账户" if _USE_CN else "Strategy",
+        color="#2f6fbf",
+        linewidth=2,
+    )
     ax2.plot(
         eq["date"],
         eq["bench_equity"],
-        label="沪深300",
+        label="沪深300" if _USE_CN else "CSI300",
         color="#d9822b",
         linewidth=1.6,
         linestyle="--",
     )
-    ax2.set_title("账户收益 vs 沪深300", fontsize=13)
-    ax2.set_ylabel("权益(元)")
+    ax2.set_title(
+        "账户收益 vs 沪深300" if _USE_CN else "Account Equity vs CSI300",
+        fontsize=13,
+    )
+    ax2.set_ylabel("权益(元)" if _USE_CN else "Equity (CNY)")
     ax2.legend()
     ax2.grid(alpha=0.3)
 
     last = eq.iloc[-1]
     fig.suptitle(
-        f"QuantTrader 日报图表 · 最新交易日 {last['date'].strftime('%Y-%m-%d')} · "
-        f"权益 {last['equity']:,.0f}元",
+        (
+            f"QuantTrader 日报图表 · 最新交易日 {last['date'].strftime('%Y-%m-%d')} · "
+            f"权益 {last['equity']:,.0f}元"
+            if _USE_CN
+            else f"QuantTrader Daily Chart · {last['date'].strftime('%Y-%m-%d')} · "
+            f"Equity {last['equity']:,.0f} CNY"
+        ),
         fontsize=14,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.95])
