@@ -7,6 +7,9 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # timezone data + cron (for daily scheduled trading)
+# 国内服务器使用阿里云 apt 镜像源, 避免 Ubuntu 官方源超时
+RUN sed -i 's@//archive.ubuntu.com@//mirrors.aliyun.com@g; s@//security.ubuntu.com@//mirrors.aliyun.com@g' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata cron fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
