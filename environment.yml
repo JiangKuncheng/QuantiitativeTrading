@@ -12,3 +12,4 @@ dependencies:
       - akshare>=1.12
       - pandas-ta>=0.3.14b0
       - pyarrow>=15
+      - matplotlib>=3.8

@@ -5,3 +5,5 @@ akshare>=1.12
 pandas-ta>=0.3.14b0
 # Parquet 行情缓存引擎(推荐, 不装时自动回退 CSV)
 pyarrow>=15
+# 持仓图等可视化
+matplotlib>=3.8

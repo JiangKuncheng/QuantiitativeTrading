@@ -1,14 +1,28 @@
+# 版本控制
 .git
 .gitignore
-.conda
 .idea
-.env
-*.log
+.vscode
+
+# 本地环境(体积巨大, 不进镜像)
+.conda
+.venv
+.venv-test
 __pycache__
 *.pyc
-data/cache
-data/*.db
-output
-logs
+
+# 密钥(通过 env_file/.env 在运行时注入, 绝不进镜像)
+.env
 config/email_config.json
 config/llm_config.json
+
+# 运行时数据(用 volume 挂载)
+data
+output
+logs
+*.db
+*.log
+
+# 测试与文档不需要进镜像
+tests
+*.md
