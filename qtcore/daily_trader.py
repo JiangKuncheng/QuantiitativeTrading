@@ -229,7 +229,8 @@ class DailyTrader:
             except RuntimeError as exc:
                 # 当日行情未发布是常见情况(新浪/腾讯收盘后一两个小时才出当日日线),
                 # 自动等待重试, 数据一到即出日报; 超过重试上限才发突发告警
-                if "行情数据未发布" in str(exc) and attempt < settle_retries:
+                stale_msgs = ("行情数据未发布", "基准指数数据未更新到今日")
+                if any(k in str(exc) for k in stale_msgs) and attempt < settle_retries:
                     print(
                         f"[Daily] 当日行情未发布, 第 {attempt + 1}/{settle_retries} 次等待, "
                         f"{settle_retry_interval} 分钟后重试..."
