@@ -70,7 +70,55 @@ def get_realtime_price(symbol: str) -> dict[str, Any] | None:
         if isinstance(df, pd.DataFrame) and len(df):
             last_day = pd.to_datetime(df["day"].iloc[-1]).date()
             if last_day == date.today():
-                return {"price": float(df["close"].iloc[-1]), "source": "sina_60min"}
+                close = float(df["close"].iloc[-1])
+                if close > 0:
+                    return {"price": close, "source": "sina_60min"}
+    except Exception:
+        pass
+
+    return None
+
+
+def get_open_price(symbol: str) -> dict[str, Any] | None:
+    """
+    获取"今日开盘价"(今开): 东财盘口"今开" -> 新浪快照"今开" -> 新浪60分钟当日首根bar的open。
+    9:25 集合竞价结束后可用; 之后任意时刻取到都是同一个开盘价, 用于重试后仍按开盘价成交。
+    """
+    if not _HAS_AKSHARE:
+        return None
+    code = str(symbol).zfill(6)
+
+    # 1) 东财盘口: 今开
+    try:
+        df = ak.stock_bid_ask_em(symbol=code)
+        item = {str(row.iloc[0]): row.iloc[1] for _, row in df.iterrows()}
+        price = item.get("今开")
+        if price is not None and float(price) > 0:
+            return {"price": float(price), "source": "eastmoney_open"}
+    except Exception:
+        pass
+
+    # 2) 新浪全市场快照: 今开
+    try:
+        df = ak.stock_zh_a_spot()
+        row = df[df["代码"].astype(str).str.zfill(6) == code]
+        if not row.empty:
+            price = float(row.iloc[0]["今开"])
+            if price > 0:
+                return {"price": price, "source": "sina_open"}
+    except Exception:
+        pass
+
+    # 3) 新浪60分钟: 当日第一根bar的 open(即今日开盘价)
+    try:
+        df = ak.stock_zh_a_minute(symbol=_to_exchange_symbol(code), period="60", adjust="qfq")
+        if isinstance(df, pd.DataFrame) and len(df):
+            today_mask = pd.to_datetime(df["day"]).dt.date == date.today()
+            today_bars = df[today_mask]
+            opens = pd.to_numeric(today_bars["open"], errors="coerce")
+            valid = today_bars[opens.notna() & (opens > 0)]
+            if len(valid):
+                return {"price": float(valid.iloc[0]["open"]), "source": "sina_60min_open"}
     except Exception:
         pass
 

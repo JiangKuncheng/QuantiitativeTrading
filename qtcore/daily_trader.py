@@ -37,7 +37,7 @@ from qtcore.report_writer import (
     write_monthly_report,
     write_weekly_report,
 )
-from qtcore.realtime import get_realtime_price
+from qtcore.realtime import get_open_price
 from qtcore.store import Store
 from qtcore.strategy import create_strategy
 
@@ -556,13 +556,15 @@ class DailyTrader:
     def execute_plan(
         self,
         run_date: str | None = None,
-        wait_minutes: int = 15,
+        retries: int = 5,
+        retry_interval: int = 10,
     ) -> dict[str, Any]:
         """
         9:20 执行任务(两步):
           Step 1: 读取昨日收盘生成的当日计划(plans 表);
-          Step 2: 等到开盘价确定后(9:25 集合竞价结束)成交; 最长等 wait_minutes 分钟,
-                  仍拿不到开盘价则发突发告警, 不瞎成交。
+          Step 2: 9:25 集合竞价结束后取"今日开盘价"成交; 拿不到则每 retry_interval 分钟
+                  重试, 最多 retries 次; 重试成功后仍按开盘价(今开)成交, 不按重试时最新价;
+                  全部重试后仍拿不到则发突发告警, 不瞎成交。
         - simulation 模式: 计划由 16:00 结算回放执行, 此处只展示不成交;
         - realtime 模式: 拉实时价成交, 拿不到实时价则发突发告警。
         """
@@ -591,10 +593,14 @@ class DailyTrader:
             return {"executed": False, "reason": "no_action", "plans": plans}
 
         # Step 2: 等到开盘价可用后成交(9:25 集合竞价结束, 轮询最长 wait_minutes 分钟)
-        print(f"[Execute] {d_iso} 等待开盘价(最长 {wait_minutes} 分钟)...")
+        print(
+            f"[Execute] {d_iso} 获取开盘价: 9:25 首次, 失败每 {retry_interval} 分钟重试, "
+            f"最多 {retries} 次..."
+        )
         got, missing = self._wait_open_prices(
             [p["code"] for p in needed],
-            wait_minutes=wait_minutes,
+            retries=retries,
+            interval_minutes=retry_interval,
         )
         if missing:
             self._handle_incident(
@@ -643,29 +649,35 @@ class DailyTrader:
     def _wait_open_prices(
         self,
         codes: list[str],
-        wait_minutes: int = 15,
-        interval: int = 30,
+        retries: int = 5,
+        interval_minutes: int = 10,
     ) -> tuple[dict[str, float], list[str]]:
         """
-        轮询等待开盘价: 北京时间 9:26 之后(9:25 集合竞价结束)才开始取价,
-        全部拿到返回 (prices, []); 超时返回 (已有, 缺失列表)。
+        获取开盘价: 9:25 集合竞价结束后首次尝试(取"今开"), 未取齐则每 interval_minutes
+        分钟重试一次, 最多 retries 次; 全部拿到返回 (prices, []), 否则返回 (已有, 缺失)。
         """
-        deadline = time.time() + max(wait_minutes, 0) * 60
         got: dict[str, float] = {}
-        while time.time() < deadline:
+        attempt = 0
+        while True:
             now = datetime.now()
-            after_open = (now.hour, now.minute) >= (9, 26)  # 集合竞价结束, 开盘价确定
-            if after_open:
+            if (now.hour, now.minute) >= (9, 25):  # 9:25 集合竞价结束, 开盘价确定
                 for code in codes:
                     if code in got:
                         continue
-                    quote = get_realtime_price(code)
+                    quote = get_open_price(code)
                     if quote is not None:
                         got[code] = float(quote["price"])
                 if len(got) == len(codes):
                     print(f"[Execute] 开盘价就绪: {got}")
                     return got, []
-            time.sleep(interval)
+            if attempt >= retries:
+                break
+            attempt += 1
+            print(
+                f"[Execute] 第 {attempt}/{retries} 次未取齐, "
+                f"{interval_minutes} 分钟后重试..."
+            )
+            time.sleep(interval_minutes * 60)
         missing = [c for c in codes if c not in got]
         return got, missing
 
