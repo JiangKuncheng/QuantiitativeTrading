@@ -1,6 +1,10 @@
 services:
   quant-trading:
-    build: .
+    build:
+      context: .
+      args:
+        # 国内服务器用阿里云 pip 源, 避免 PyPI 超时
+        PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
     container_name: quantitative-trading
     env_file:
       - .env
