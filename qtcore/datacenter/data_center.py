@@ -122,8 +122,18 @@ class DataCenter:
         if use_cache and cache_path.exists():
             cached = self._read_cache(cache_path, symbol)
             if cached is not None and not cached.empty:
-                print(f"[DataCenter] 命中缓存: {cache_path.name} ({len(cached)} 根K线)")
-                return self._slice(cached, start_ts, end_ts)
+                cached_last = cached.index[-1].strftime("%Y%m%d")
+                end_key = end_ts.strftime("%Y%m%d") if end_ts is not None else ""
+                if end_key and cached_last < end_key:
+                    # 缓存最新日早于请求日(例如当天数据刚发布, 缓存是收盘前拉的过期数据):
+                    # 视为缓存过期, 强制重新拉取覆盖
+                    print(
+                        f"[DataCenter] 缓存最新日 {cached_last} < 请求日 {end_key}, "
+                        f"重新拉取覆盖"
+                    )
+                else:
+                    print(f"[DataCenter] 命中缓存: {cache_path.name} ({len(cached)} 根K线)")
+                    return self._slice(cached, start_ts, end_ts)
 
         # 2) 实时获取 akshare, 失败则降级合成数据
         try:
@@ -210,8 +220,16 @@ class DataCenter:
         if self.config.use_cache and cache_path.exists():
             cached = self._read_cache(cache_path, symbol)
             if cached is not None and not cached.empty:
-                print(f"[DataCenter] 命中缓存: {cache_path.name} ({len(cached)} 根K线)")
-                return self._slice(cached, self._parse_date(start), self._parse_date(end))
+                cached_last = cached.index[-1].strftime("%Y%m%d")
+                end_key = self._parse_date(end).strftime("%Y%m%d") if self._parse_date(end) else ""
+                if end_key and cached_last < end_key:
+                    print(
+                        f"[DataCenter] 日内缓存最新日 {cached_last} < 请求日 {end_key}, "
+                        f"重新拉取覆盖"
+                    )
+                else:
+                    print(f"[DataCenter] 命中缓存: {cache_path.name} ({len(cached)} 根K线)")
+                    return self._slice(cached, self._parse_date(start), self._parse_date(end))
 
         raw = self._fetch_60min(symbol)
         df = self.normalize(raw, code=symbol)
