@@ -7,6 +7,9 @@ services:
     environment:
       - TZ=Asia/Shanghai
     volumes:
+      # 密钥文件挂载进容器: cron 任务不继承 env_file 的环境变量,
+      # 代码通过 load_dotenv() 读取 /app/.env 兜底
+      - ./.env:/app/.env:ro
       # 数据/输出/日志持久化到宿主机
       - ./data:/app/data
       - ./output:/app/output
