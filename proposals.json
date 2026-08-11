@@ -1,0 +1,31 @@
+[
+  {
+    "fast": 5,
+    "slow": 20,
+    "long_short": false,
+    "top_k": 5,
+    "select_metric": "sharpe"
+  },
+  {
+    "fast": 8,
+    "slow": 30,
+    "long_short": false,
+    "top_k": 5,
+    "select_metric": "sharpe"
+  },
+  {
+    "fast": 3,
+    "slow": 30,
+    "long_short": false,
+    "top_k": 3,
+    "select_metric": "total_return"
+  },
+  {
+    "fast": 5,
+    "slow": 20,
+    "long_short": false,
+    "top_k": 8,
+    "select_metric": "sharpe",
+    "position_ratio": 0.8
+  }
+]

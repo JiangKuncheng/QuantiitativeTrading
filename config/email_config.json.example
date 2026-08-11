@@ -1,0 +1,8 @@
+{
+  "sender": "your_account@example.com",
+  "sender_name": "QuantTrader Auto",
+  "auth_code": "YOUR_SMTP_AUTH_CODE",
+  "smtp_host": "smtp.163.com",
+  "smtp_port": 465,
+  "recipients": ["you@example.com"]
+}

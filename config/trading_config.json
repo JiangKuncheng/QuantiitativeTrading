@@ -1,0 +1,31 @@
+{
+  "initial_capital": 1000000,
+  "data_start": "20200101",
+  "account_start": "20260810",
+  "timeframe": "daily",
+  "pool": {"source": "csi300", "size": 15},
+  "benchmark": "000300",
+  "strategy": {
+    "name": "ma_cross",
+    "params": {
+      "fast": 5,
+      "slow": 25,
+      "use_rsi": false,
+      "timeframe": "daily",
+      "top_k": 6,
+      "select_metric": "sharpe",
+      "position_ratio": 0.95,
+      "max_position_ratio": 1.0,
+      "rebalance": "daily",
+      "order_type": "market",
+      "slippage_tolerance_pct": 0.0,
+      "leverage": 1.0,
+      "stop_loss_pct": 0.0,
+      "take_profit_pct": 0.0,
+      "max_drawdown_halt": 0.2,
+      "halt_cooldown_days": 5,
+      "halt_resume_drawdown": 0.1
+    }
+  },
+  "report": {"daily": true, "weekly": true, "monthly": true}
+}

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 运行时数据(行情缓存与回测输出)
+data/cache/
+output/
+logs/
+data/*.db
+data/trade_calendar.csv
+*.log
+
+# 工作区内的 Conda 环境(可随时用 environment.yml 重建)
+.conda/
+
+# 环境变量密钥文件(邮箱授权码 / DeepSeek API Key), 只提交 .env.example
+.env
+
+# 敏感配置(邮箱授权码 / LLM API Key)
+config/email_config.json
+config/llm_config.json
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store

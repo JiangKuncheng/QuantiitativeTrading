@@ -1,0 +1,30 @@
+[
+  {
+    "fast": 3,
+    "slow": 30,
+    "long_short": false,
+    "top_k": 3,
+    "select_metric": "total_return"
+  },
+  {
+    "fast": 3,
+    "slow": 30,
+    "long_short": false,
+    "top_k": 3,
+    "select_metric": "sharpe"
+  },
+  {
+    "fast": 5,
+    "slow": 40,
+    "long_short": false,
+    "top_k": 3,
+    "select_metric": "total_return"
+  },
+  {
+    "fast": 3,
+    "slow": 40,
+    "long_short": false,
+    "top_k": 3,
+    "select_metric": "total_return"
+  }
+]

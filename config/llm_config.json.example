@@ -1,0 +1,4 @@
+{
+  "deepseek_api_key": "sk-YOUR_DEEPSEEK_API_KEY",
+  "model": "deepseek-chat"
+}

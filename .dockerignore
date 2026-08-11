@@ -1,0 +1,14 @@
+.git
+.gitignore
+.conda
+.idea
+.env
+*.log
+__pycache__
+*.pyc
+data/cache
+data/*.db
+output
+logs
+config/email_config.json
+config/llm_config.json

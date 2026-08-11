@@ -1,0 +1,14 @@
+name: QuantitativeTrading
+channels:
+  - conda-forge
+dependencies:
+  # pandas-ta 0.4.x 要求 Python >=3.12, 因此统一使用 3.12
+  - python=3.12
+  - pip
+  - pandas>=2.0,<3
+  - numpy>=1.24,<3
+  # akshare / pandas-ta 未发布到 conda-forge, 统一走 pip 安装
+  - pip:
+      - akshare>=1.12
+      - pandas-ta>=0.3.14b0
+      - pyarrow>=15
