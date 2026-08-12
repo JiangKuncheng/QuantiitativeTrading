@@ -260,7 +260,7 @@ class DailyTrader:
         # 1) 逐只回测到今日
         returns: dict[str, pd.Series] = {}
         last_dates: dict[str, str] = {}
-        last_close: dict[str, float] = {}
+        last_close_prices: dict[str, float] = {}
         today_trades: list[dict[str, Any]] = []
         holdings: dict[str, dict[str, Any]] = {}
         targets: dict[str, int] = {}
@@ -280,7 +280,7 @@ class DailyTrader:
                 eq = result.equity_curve
                 returns[code] = eq["daily_return"]
                 last_dates[code] = bars.index[-1].strftime("%Y-%m-%d")
-                last_close[code] = float(bars["close"].iloc[-1])
+                last_close_prices[code] = float(bars["close"].iloc[-1])
                 trades = result.trades
                 if not trades.empty:
                     mask = trades["datetime"].dt.strftime("%Y-%m-%d") == d_iso
@@ -440,9 +440,9 @@ class DailyTrader:
         # 持仓一律以账户成交记录为准(账户口径), 不再用回测全仓口径
         holdings = self.store.holdings_net()
         for code, h in holdings.items():
-            if code in last_close:
-                h["last_close"] = last_close[code]
-                h["value"] = round(h["units"] * last_close[code], 2)
+            if code in last_close_prices:
+                h["last_close"] = last_close_prices[code]
+                h["value"] = round(h["units"] * last_close_prices[code], 2)
         # 生成明日交易计划(供次日 9:20 执行 / 模拟模式 16:00 回放)
         tomorrow_plan = self._save_tomorrow_plan(today, params, targets, holdings, halted)
         self.store.log_run(d_iso, "daily", "ok", f"equity={today_equity:.2f}")
