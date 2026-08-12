@@ -260,6 +260,7 @@ class DailyTrader:
         # 1) 逐只回测到今日
         returns: dict[str, pd.Series] = {}
         last_dates: dict[str, str] = {}
+        last_close: dict[str, float] = {}
         today_trades: list[dict[str, Any]] = []
         holdings: dict[str, dict[str, Any]] = {}
         targets: dict[str, int] = {}
@@ -279,6 +280,7 @@ class DailyTrader:
                 eq = result.equity_curve
                 returns[code] = eq["daily_return"]
                 last_dates[code] = bars.index[-1].strftime("%Y-%m-%d")
+                last_close[code] = float(bars["close"].iloc[-1])
                 trades = result.trades
                 if not trades.empty:
                     mask = trades["datetime"].dt.strftime("%Y-%m-%d") == d_iso
@@ -355,6 +357,27 @@ class DailyTrader:
         benchmark_return = float(bench_ret.iloc[-1]) if not np.isnan(bench_ret.iloc[-1]) else 0.0
         benchmark_total = float(bench_close.iloc[-1] / bench_close.iloc[0] - 1.0) if len(bench_close) > 1 else 0.0
 
+        # 回测成交按账户口径重算股数: BUY 按账户等权预算, SELL 不超过实际持仓
+        if today_trades:
+            bt_cfg = self._bt_config(params)
+            buys = [t for t in today_trades if t["side"] in ("BUY", "SELL_SHORT")]
+            budget_each = prev_equity * bt_cfg.position_ratio / max(len(buys), 1)
+            actual_holdings = self.store.holdings_net()
+            for t in today_trades:
+                if t["side"] in ("BUY", "SELL_SHORT"):
+                    t["units"] = (
+                        int(budget_each / (t["price"] * self.app.backtest.lot_size))
+                        * self.app.backtest.lot_size
+                    )
+                else:
+                    t["units"] = min(
+                        t["units"],
+                        actual_holdings.get(t["code"], {}).get("units", 0),
+                    )
+                t["commission"] = round(
+                    t["units"] * t["price"] * bt_cfg.commission_rate, 4
+                )
+
         # 建仓日: 账户从今天开始, 按今日收盘信号建仓, 当日盈亏记 0
         first_day = d_str == str(self.cfg.get("account_start", d_str))
         if first_day:
@@ -414,6 +437,12 @@ class DailyTrader:
         halted = self._account_halt_check(today, d_iso, params)
         self.store.save_trades(today_trades)
         self.store.save_signals(d_iso, targets, params)
+        # 持仓一律以账户成交记录为准(账户口径), 不再用回测全仓口径
+        holdings = self.store.holdings_net()
+        for code, h in holdings.items():
+            if code in last_close:
+                h["last_close"] = last_close[code]
+                h["value"] = round(h["units"] * last_close[code], 2)
         # 生成明日交易计划(供次日 9:20 执行 / 模拟模式 16:00 回放)
         tomorrow_plan = self._save_tomorrow_plan(today, params, targets, holdings, halted)
         self.store.log_run(d_iso, "daily", "ok", f"equity={today_equity:.2f}")

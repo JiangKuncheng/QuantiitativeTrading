@@ -229,6 +229,28 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def holdings_net(self) -> dict[str, dict[str, Any]]:
+        """按成交记录计算当前持仓(账户口径): code -> {units, avg_cost}。"""
+        net: dict[str, int] = {}
+        cost: dict[str, float] = {}
+        for code, side, units, price in self.conn.execute(
+            "SELECT code, side, units, price FROM trades ORDER BY id"
+        ):
+            u = int(units)
+            if side in ("BUY", "SELL_SHORT"):
+                net[code] = net.get(code, 0) + u
+                cost[code] = cost.get(code, 0.0) + u * float(price)
+            else:
+                net[code] = net.get(code, 0) - u
+        out: dict[str, dict[str, Any]] = {}
+        for code, units in net.items():
+            if units > 0:
+                out[code] = {
+                    "units": units,
+                    "avg_cost": round(cost.get(code, 0.0) / units, 4),
+                }
+        return out
+
     def save_state(
         self,
         date: str,
