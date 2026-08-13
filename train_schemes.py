@@ -54,7 +54,7 @@ def load_pool(market: str, app: AppConfig) -> list[str]:
     return df["code"].tolist()
 
 
-def sanitize(p: dict[str, Any], market: str, mode: str) -> dict[str, Any]:
+def sanitize(p: dict[str, Any], market: str, mode: str, force_timeframe: str | None = None) -> dict[str, Any]:
     lo, hi = 0.2, 1.0
 
     def cl(v, a, b):
@@ -64,8 +64,10 @@ def sanitize(p: dict[str, Any], market: str, mode: str) -> dict[str, Any]:
     slow = int(cl(p.get("slow", 25), 10, 120))
     if slow <= fast:
         slow = fast + 10
-    allowed_tf = ("daily", "60min", "2h", "4h") if market == "cn" else ("daily",)
-    tf = p.get("timeframe", "daily")
+    allowed_tf = [force_timeframe] if force_timeframe else (
+        ("daily", "60min", "2h", "4h") if market == "cn" else ("daily",)
+    )
+    tf = p.get("timeframe", force_timeframe or "daily")
     if tf not in allowed_tf:
         tf = "daily"
     out = {
@@ -113,6 +115,7 @@ def run_scheme(
     pool: list[str],
     rounds: int,
     tuner: DeepSeekTuner | None,
+    force_timeframe: str | None = None,
 ) -> dict[str, Any]:
     app = AppConfig()
     training = TrainingConfig()
@@ -122,9 +125,12 @@ def run_scheme(
 
     for r in range(1, rounds + 1):
         if tuner is None:
-            proposal = sanitize({"fast": 5, "slow": 25, "timeframe": "daily"}, market, mode)
+            proposal = sanitize(
+                {"fast": 5, "slow": 25, "timeframe": force_timeframe or "daily"},
+                market, mode, force_timeframe,
+            )
         else:
-            proposal = sanitize(tuner.propose(history), market, mode)
+            proposal = sanitize(tuner.propose(history), market, mode, force_timeframe)
         proposal["market"] = market
         proposal["position_mode"] = mode
         print(f"[{market}/{mode}] 第 {r}/{rounds} 轮: {json.dumps({k: proposal[k] for k in ('fast','slow','timeframe','top_k','position_ratio','entry_ratio','add_trigger_pct','add_ratio','max_adds') if k in proposal}, ensure_ascii=False)}")
@@ -227,6 +233,8 @@ def main() -> int:
     parser.add_argument("--markets", default="cn us hk")
     parser.add_argument("--modes", default="full staged")
     parser.add_argument("--no-llm", action="store_true", help="不使用 DeepSeek, 固定基线参数(测试用)")
+    parser.add_argument("--force-timeframe", choices=["daily", "60min", "2h", "4h"], default=None,
+                        help="强制所有方案使用该K线周期(如测美股/港股日内)")
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -237,13 +245,16 @@ def main() -> int:
 
     markets = args.markets.split()
     modes = args.modes.split()
+    intraday_suffix = (
+        "_intraday" if args.force_timeframe and args.force_timeframe != "daily" else ""
+    )
     schemes: list[dict[str, Any]] = []
     for market in markets:
         pool = load_pool(market, app)
         print(f"\n===== 股票池 {MARKET_NAMES[market]}: {len(pool)} 只 =====")
         for mode in modes:
             print(f"\n===== 训练方案: {MARKET_NAMES[market]} {MODE_NAMES[mode]} =====")
-            json_path = OUT_DIR / f"{market}_{mode}.json"
+            json_path = OUT_DIR / f"{market}_{mode}{intraday_suffix}.json"
             if json_path.exists():
                 print(f"[跳过] {market}/{mode} 已完成, 载入结果")
                 data = json.loads(json_path.read_text(encoding="utf-8"))
@@ -252,7 +263,7 @@ def main() -> int:
                 )
                 schemes.append({"market": market, "mode": mode, "best": data})
                 continue
-            scheme = run_scheme(market, mode, pool, args.rounds, tuner)
+            scheme = run_scheme(market, mode, pool, args.rounds, tuner, args.force_timeframe)
             schemes.append(scheme)
             # 立即保存, 支持断点续训
             b = scheme["best"]
