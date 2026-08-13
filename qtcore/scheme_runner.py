@@ -113,8 +113,9 @@ def run_schemes_daily(
     today: date,
     d_str: str,
     email_cfg: dict[str, Any] | None = None,
+    send_email: bool = True,
 ) -> dict[str, Any]:
-    """评估 6 方案、记账、出图、发日报。"""
+    """评估 6 方案、记账、出图; send_email=True 时单独发送六方案日报邮件。"""
     schemes = load_schemes()
     if not schemes:
         raise RuntimeError("未找到训练好的方案配置(output/schemes)")
@@ -134,11 +135,11 @@ def run_schemes_daily(
     chart_paths = _charts(rows, store)
     report = _report_text(rows)
     subject = f"[QuantTrader] 六方案日报 {d_iso}"
-    if email_cfg:
+    if email_cfg and send_email:
         send_email(subject, report, config=email_cfg, attachments=chart_paths)
         store.save_report(d_iso, "schemes_daily", subject, report)
         print(f"[Scheme] 六方案日报已发送: {subject}")
-    return {"rows": rows, "charts": chart_paths}
+    return {"rows": rows, "charts": chart_paths, "report": report}
 
 
 def _charts(rows: list[dict[str, Any]], store: Store) -> list[Path]:
