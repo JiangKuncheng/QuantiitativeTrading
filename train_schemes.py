@@ -243,17 +243,30 @@ def main() -> int:
         print(f"\n===== 股票池 {MARKET_NAMES[market]}: {len(pool)} 只 =====")
         for mode in modes:
             print(f"\n===== 训练方案: {MARKET_NAMES[market]} {MODE_NAMES[mode]} =====")
+            json_path = OUT_DIR / f"{market}_{mode}.json"
+            if json_path.exists():
+                print(f"[跳过] {market}/{mode} 已完成, 载入结果")
+                data = json.loads(json_path.read_text(encoding="utf-8"))
+                data["test_returns"] = pd.Series(
+                    {pd.Timestamp(k): v for k, v in data.get("test_returns", {}).items()}
+                )
+                schemes.append({"market": market, "mode": mode, "best": data})
+                continue
             scheme = run_scheme(market, mode, pool, args.rounds, tuner)
             schemes.append(scheme)
+            # 立即保存, 支持断点续训
+            b = scheme["best"]
+            payload = {k: v for k, v in b.items() if k != "test_returns"}
+            payload["test_returns"] = {str(k): v for k, v in b["test_returns"].items()}
+            json_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            print(f"[已保存] {json_path}")
 
     # 保存与绘图
     summary_rows = []
     for s in schemes:
-        b = s["best"]
-        out_json = OUT_DIR / f"{s['market']}_{s['mode']}.json"
-        payload = {k: v for k, v in b.items() if k != "test_returns"}
-        payload["test_returns"] = {str(k): v for k, v in b["test_returns"].items()}
-        out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         chart_scheme(s)
         summary_rows.append(
             {
