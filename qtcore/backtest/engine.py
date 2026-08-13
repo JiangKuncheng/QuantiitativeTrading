@@ -85,14 +85,15 @@ class BacktestEngine:
         )
 
         # 策略输出: 目标仓位序列 + 信号事件流
-        targets = strategy.target_positions(bars).astype(int)
+        targets = strategy.target_positions(bars).astype(float)
         signal_events = strategy.generate_signal_events(bars)
 
         # 逐日事件循环
-        pending_target: int | None = None  # 上一根K线收盘产生的目标仓位
+        pending_target: float | None = None  # 上一根K线收盘产生的目标仓位
         halted = False                     # 回撤熔断: 触发后停止开新仓并清仓
         halt_since_i: int | None = None    # 熔断触发时的K线序号(用于冷却期计算)
         prev_close: float | None = None    # 上一根K线收盘价(限价单基准)
+        last_target_fraction: float | None = None  # 最近一次实际执行的目标比例(避免无变化时重复调仓)
         for i, ts in enumerate(bars.index):
             bar = bars.iloc[i]
             open_price = float(bar["open"])
@@ -123,11 +124,16 @@ class BacktestEngine:
             # 1) 撮合昨日收盘信号: 以今日开盘价成交(延迟 1 根K线)
             if pending_target is not None and self._is_rebalance_day(ts, i, bars.index):
                 if not halted:
-                    self._execute_target(account, code, pending_target, open_price, ts, prev_close)
+                    if (
+                        last_target_fraction is None
+                        or abs(float(pending_target) - last_target_fraction) > 1e-6
+                    ):
+                        self._execute_target(account, code, pending_target, open_price, ts, prev_close)
+                        last_target_fraction = float(pending_target)
                 pending_target = None
 
             # 2) 今日收盘更新目标仓位(次日开盘执行)
-            pending_target = int(targets.iloc[i])
+            pending_target = float(targets.iloc[i])
 
             # 3) 收盘估值, 记录权益曲线
             account.mark_to_market(ts, {code: close_price})
@@ -139,6 +145,7 @@ class BacktestEngine:
                 if dd <= -abs(self.config.max_drawdown_halt):
                     halted = True
                     halt_since_i = i
+                    last_target_fraction = 0.0
                     print(
                         f"[Backtest] {ts.date()} 触发回撤熔断: {dd:.2%}, "
                         f"清仓并暂停开仓(冷却 {self.config.halt_cooldown_days} 日)"
@@ -164,28 +171,23 @@ class BacktestEngine:
         self,
         account: Account,
         code: str,
-        target: int,
+        target: float,
         price: float,
         ts: pd.Timestamp,
         prev_close: float | None = None,
     ) -> None:
         """
-        将当前持仓调整到目标仓位。
-        target: 1 持多 / 0 空仓 / -1 持空(需允许做空)
+        将当前持仓调整到目标仓位比例。
+        target: 1 全仓做多 / (0,1) 部分仓位(补仓玩法) / 0 空仓 / -1 全仓做空
         """
+        target = float(target)
         pos = account.positions.get(code)
-        current = 0
-        if pos is not None:
-            current = 1 if pos.side == "long" else -1
-
-        if target == current:
-            return  # 无需调仓
 
         # 订单类型: limit 限价单 -> 次日开盘不满足限价条件则放弃本次交易
         if self.config.order_type == "limit" and prev_close is not None and prev_close > 0:
-            if target == 1 and price > prev_close * 1.001:
+            if target > 0 and price > prev_close * 1.001:
                 return  # 买入限价未触及(高开跳过)
-            if target == -1 and price < prev_close * 0.999:
+            if target < 0 and price < prev_close * 0.999:
                 return
 
         # 滑点容忍度: 实际滑点超过设定容忍则放弃交易
@@ -193,27 +195,59 @@ class BacktestEngine:
             if self.config.slippage_rate > self.config.slippage_tolerance_pct:
                 return
 
-        if target == 0:
-            self._close_all(account, code, price, ts)
+        if target <= -0.99:  # 全仓做空(原逻辑)
+            if not self.config.allow_short:
+                if pos is not None:
+                    self._close_all(account, code, price, ts)
+                return
+            if pos is not None:
+                if pos.side == "long":
+                    self._close_all(account, code, price, ts)
+                else:
+                    return  # 已持空仓, 无需重复建仓
+            units = self._sizing(account, price)
+            if units > 0:
+                account.open_short(code, units, self._exec_price(price, is_buy=True), ts)
             return
 
-        if target == 1:
-            if pos is not None and pos.side == "short":  # 空头 -> 多头
+        if target <= 0:
+            if pos is not None:
                 self._close_all(account, code, price, ts)
+            return
+
+        if target >= 0.99:  # 全仓买入(原逻辑)
+            if pos is not None:
+                if pos.side == "short":  # 空头 -> 多头
+                    self._close_all(account, code, price, ts)
+                else:
+                    return  # 已持多仓, 无需重复满仓买入
             units = self._sizing(account, price)
             if units > 0:
                 account.open_long(code, units, self._exec_price(price, is_buy=True), ts)
             return
 
-        # target == -1
-        if not self.config.allow_short:
-            self._close_all(account, code, price, ts)  # 不允许做空时视为清仓
-            return
-        if pos is not None and pos.side == "long":  # 多头 -> 空头
+        # (0,1) 部分仓位/补仓: 目标股数 = 权益 * 仓位比例 * 目标比例
+        current_units = pos.units if (pos is not None and pos.side == "long") else 0
+        if pos is not None and pos.side == "short":
             self._close_all(account, code, price, ts)
-        units = self._sizing(account, price)
-        if units > 0:
-            account.open_short(code, units, self._exec_price(price, is_buy=True), ts)
+            current_units = 0
+        equity = account.live_equity({p.code: price for p in account.positions.values()})
+        desired = (
+            int(equity * self.config.position_ratio * target / (price * self.config.lot_size))
+            * self.config.lot_size
+        )
+        cap = (
+            int(equity * self.config.max_position_ratio / (price * self.config.lot_size))
+            * self.config.lot_size
+        )
+        desired = min(desired, cap)
+        delta = desired - current_units
+        if delta == 0:
+            return
+        if delta > 0:
+            account.open_long(code, delta, self._exec_price(price, is_buy=True), ts)
+        else:
+            account.close_long(code, -delta, self._exec_price(price, is_buy=False), ts)
 
     def _check_stops(
         self,

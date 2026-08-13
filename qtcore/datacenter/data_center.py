@@ -194,17 +194,55 @@ class DataCenter:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         timeframe: str = "daily",
+        market: str = "cn",
     ) -> pd.DataFrame:
         """
-        按时间框架获取统一K线: daily(日线, 全历史) / 60min / 2h / 4h / 6h。
-        日内线基础为 60 分钟(新浪, 约2年历史), 再重采样为 2h/4h/6h;
-        东财分钟线(全历史)作为第二数据源(本机被网关拦截, 阿里云服务器可用)。
+        按时间框架获取统一K线: daily / 60min / 2h / 4h / 6h。
+        market: cn(A股, 日线+新浪60分钟) / us(美股, 新浪日线) / hk(港股, 新浪日线)。
         """
+        if market in ("us", "hk"):
+            return self._get_us_hk_bars(symbol, start_date, end_date, market)
         if timeframe == "daily" or timeframe is None:
             return self.get_daily_bars(symbol, start_date, end_date)
         if timeframe not in self.INTRADAY_TIMEFRAMES:
             raise ValueError(f"不支持的时间框架: {timeframe}, 可选 {self.INTRADAY_TIMEFRAMES}")
         return self._get_intraday_bars(symbol, start_date, end_date, timeframe)
+
+    def _get_us_hk_bars(
+        self,
+        symbol: str,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        market: str,
+    ) -> pd.DataFrame:
+        """美股/港股日线(新浪): us -> stock_us_daily, hk -> stock_hk_daily。"""
+        self._require_akshare()
+        start = start_date or self.config.start_date
+        end = end_date or self.config.end_date
+        cache_path = self.paths.cache_dir / f"{market}_daily_{symbol}_{start}_{end}.parquet"
+        if self.config.use_cache and cache_path.exists():
+            cached = self._read_cache(cache_path, symbol)
+            if cached is not None and not cached.empty:
+                cached_last = cached.index[-1].strftime("%Y%m%d")
+                end_key = self._parse_date(end).strftime("%Y%m%d") if self._parse_date(end) else ""
+                if not (end_key and cached_last < end_key):
+                    print(f"[DataCenter] 命中缓存: {cache_path.name} ({len(cached)} 根K线)")
+                    return self._slice(cached, self._parse_date(start), self._parse_date(end))
+        raw = (
+            ak.stock_us_daily(symbol=str(symbol), adjust="qfq")
+            if market == "us"
+            else ak.stock_hk_daily(symbol=str(symbol), adjust="qfq")
+        )
+        df = self.normalize(raw, code=str(symbol))
+        df.attrs["source"] = f"sina_{market}"
+        df = self._slice(df, self._parse_date(start), self._parse_date(end))
+        if self.config.use_cache:
+            try:
+                df.to_parquet(cache_path)
+            except Exception:
+                pass
+        print(f"[DataCenter] {market.upper()} 行情就绪: {symbol} {len(df)} 根K线(来源 sina)")
+        return df
 
     def _get_intraday_bars(
         self,

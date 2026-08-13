@@ -116,7 +116,8 @@ class PortfolioEvaluator:
         for code in symbols:
             try:
                 timeframe = str(strategy_params.get("timeframe", "daily")).lower()
-                bars = self._load_bars(code, start, end, timeframe)
+                market = str(strategy_params.get("market", "cn")).lower()
+                bars = self._load_bars(code, start, end, timeframe, market)
                 min_bars = 240 if timeframe != "daily" else 120
                 if bars is None or len(bars) < min_bars:
                     continue
@@ -225,7 +226,8 @@ class PortfolioEvaluator:
         for code in symbols:
             try:
                 timeframe = str(strategy_params.get("timeframe", "daily")).lower()
-                bars = self._load_bars(code, start, end, timeframe)
+                market = str(strategy_params.get("market", "cn")).lower()
+                bars = self._load_bars(code, start, end, timeframe, market)
                 min_bars = 240 if timeframe != "daily" else 60
                 if bars is None or len(bars) < min_bars:
                     continue
@@ -257,7 +259,14 @@ class PortfolioEvaluator:
         bt.halt_resume_drawdown = float(strategy_params.get("halt_resume_drawdown", bt.halt_resume_drawdown))
         return bt
 
-    def _load_bars(self, code: str, start: str, end: str, timeframe: str = "daily") -> pd.DataFrame:
+    def _load_bars(
+        self,
+        code: str,
+        start: str,
+        end: str,
+        timeframe: str = "daily",
+        market: str = "cn",
+    ) -> pd.DataFrame:
         if self.synthetic:
             seed = sum(ord(ch) for ch in code) % 10000 or 1
             return self.dc.generate_synthetic_bars(days=600, symbol=code, seed=seed)
@@ -268,6 +277,7 @@ class PortfolioEvaluator:
             start_date=start,
             end_date=end,
             timeframe=timeframe,
+            market=market,
         )
 
 

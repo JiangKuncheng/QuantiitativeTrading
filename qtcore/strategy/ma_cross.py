@@ -47,6 +47,12 @@ class MACrossStrategy(StrategyBase):
         self.rsi_buy = float(raw.get("rsi_buy", 30.0))
         self.rsi_sell = float(raw.get("rsi_sell", 70.0))
         self.use_rsi = bool(raw.get("use_rsi", False))
+        # 建仓玩法: full 全仓一次性买入 / staged 分批建仓+回撤补仓
+        self.position_mode = str(raw.get("position_mode", "full"))
+        self.entry_ratio = float(raw.get("entry_ratio", 0.5))          # 首仓比例
+        self.add_trigger_pct = float(raw.get("add_trigger_pct", 0.05))  # 回撤触发补仓
+        self.add_ratio = float(raw.get("add_ratio", 0.5))               # 每次补仓比例
+        self.max_adds = int(raw.get("max_adds", 1))                     # 最多补仓次数
         super().__init__(raw)
 
     def validate_params(self) -> None:
@@ -56,6 +62,12 @@ class MACrossStrategy(StrategyBase):
             )
         if self.fast_window <= 0 or self.slow_window <= 0:
             raise ValueError("均线窗口必须为正整数")
+        if self.position_mode not in ("full", "staged"):
+            raise ValueError("position_mode 必须为 full 或 staged")
+        if not (0 < self.entry_ratio <= 1.0) or not (0 < self.add_ratio <= 1.0):
+            raise ValueError("entry_ratio/add_ratio 需在 (0,1]")
+        if self.add_trigger_pct < 0 or self.max_adds < 0:
+            raise ValueError("补仓参数不合法")
 
     # ------------------------------------------------------------------
     # 指标适配层
@@ -117,19 +129,54 @@ class MACrossStrategy(StrategyBase):
         valid = fast.notna() & slow.notna()
         if self.use_rsi:
             valid = valid & ind["rsi"].notna()
-        position = pd.Series(0, index=bars.index, dtype=int)
-        long_cond = valid & (fast > slow)
-        if self.use_rsi:
-            long_cond = long_cond & (ind["rsi"] < self.rsi_buy)
-        position[long_cond] = 1
-        if self.long_short:
-            short_cond = valid & (fast <= slow)
+        if self.use_rsi or self.position_mode != "staged":
+            # 原逻辑(全仓, 或 RSI 模式): 目标仓位 0/1/-1
+            position = pd.Series(0, index=bars.index, dtype=int)
+            long_cond = valid & (fast > slow)
             if self.use_rsi:
-                short_cond = short_cond & (ind["rsi"] > self.rsi_sell)
-            position[short_cond] = -1
-        elif self.use_rsi:
-            # 多头模式下 RSI 超买视为离场信号(目标仓位置 0)
-            position[valid & (ind["rsi"] > self.rsi_sell)] = 0
+                long_cond = long_cond & (ind["rsi"] < self.rsi_buy)
+            position[long_cond] = 1
+            if self.long_short:
+                short_cond = valid & (fast <= slow)
+                if self.use_rsi:
+                    short_cond = short_cond & (ind["rsi"] > self.rsi_sell)
+                position[short_cond] = -1
+            elif self.use_rsi:
+                # 多头模式下 RSI 超买视为离场信号(目标仓位置 0)
+                position[valid & (ind["rsi"] > self.rsi_sell)] = 0
+            return position
+
+        # staged 玩法(纯双均线做多): 金叉首仓, 回撤补仓, 死叉清仓
+        position = pd.Series(0.0, index=bars.index)
+        fraction = 0.0
+        entry_price = 0.0
+        adds = 0
+        for i, ts in enumerate(bars.index):
+            f = fast.iloc[i]
+            s = slow.iloc[i]
+            if pd.isna(f) or pd.isna(s):
+                fraction = 0.0
+                position.iloc[i] = 0.0
+                continue
+            if fraction <= 0.0:
+                if f > s:
+                    fraction = self.entry_ratio
+                    entry_price = float(bars["close"].iloc[i])
+                    adds = 0
+            else:
+                if f <= s:
+                    fraction = 0.0
+                else:
+                    close = float(bars["close"].iloc[i])
+                    if (
+                        adds < self.max_adds
+                        and entry_price > 0
+                        and close <= entry_price * (1.0 - self.add_trigger_pct)
+                    ):
+                        fraction = min(1.0, fraction + self.add_ratio)
+                        adds += 1
+                        entry_price = close  # 补仓后以新成本为补仓基准
+            position.iloc[i] = fraction
         return position
 
     def __repr__(self) -> str:  # 便于日志打印策略参数
