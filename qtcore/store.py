@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS equity_daily (
     benchmark_total REAL,
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS scheme_equity_daily (
+    scheme TEXT NOT NULL,
+    date TEXT NOT NULL,
+    equity REAL,
+    daily_return REAL,
+    top_symbols TEXT,
+    created_at TEXT,
+    PRIMARY KEY (scheme, date)
+);
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,
@@ -178,6 +187,29 @@ class Store:
         row = self.conn.execute(
             "SELECT equity FROM equity_daily WHERE date < ? ORDER BY date DESC LIMIT 1",
             (date_iso,),
+        ).fetchone()
+        return row["equity"] if row else None
+
+    def save_scheme_equity(self, scheme: str, date: str, equity: float, daily_return: float, top_symbols: str) -> None:
+        self.conn.execute(
+            """INSERT OR REPLACE INTO scheme_equity_daily
+               (scheme, date, equity, daily_return, top_symbols, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (scheme, date, equity, daily_return, top_symbols, datetime.now().isoformat(timespec="seconds")),
+        )
+        self.conn.commit()
+
+    def scheme_equity_series(self, scheme: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM scheme_equity_daily WHERE scheme = ? ORDER BY date",
+            (scheme,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def prev_scheme_equity(self, scheme: str, date_iso: str) -> float | None:
+        row = self.conn.execute(
+            "SELECT equity FROM scheme_equity_daily WHERE scheme = ? AND date < ? ORDER BY date DESC LIMIT 1",
+            (scheme, date_iso),
         ).fetchone()
         return row["equity"] if row else None
 

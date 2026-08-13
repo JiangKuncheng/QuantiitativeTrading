@@ -490,6 +490,14 @@ class DailyTrader:
         self.store.save_report(d_iso, "daily", subject, body)
         print(f"[Daily] 日报已发送: {subject}")
 
+        # 六方案每日评估 + 日报(独立邮件, 附 6 图 + 总对比图)
+        try:
+            from qtcore.scheme_runner import run_schemes_daily
+
+            run_schemes_daily(self.store, self.dc, today, d_str, self.email_cfg)
+        except Exception as exc:
+            print(f"[Daily] 六方案日报生成失败(不影响主日报): {exc!r}")
+
         # 5) 周报 / 月报
         if force_weekly or self._is_last_trading_day_of_week(today):
             self._send_weekly_report(today, d_iso)

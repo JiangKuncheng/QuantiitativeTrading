@@ -201,6 +201,8 @@ class DataCenter:
         market: cn(A股, 日线+新浪60分钟) / us(美股, 新浪日线) / hk(港股, 新浪日线)。
         """
         if market in ("us", "hk"):
+            if timeframe != "daily":
+                return self._get_us_hk_intraday(symbol, start_date, end_date, market, timeframe)
             return self._get_us_hk_bars(symbol, start_date, end_date, market)
         if timeframe == "daily" or timeframe is None:
             return self.get_daily_bars(symbol, start_date, end_date)
@@ -242,6 +244,44 @@ class DataCenter:
             except Exception:
                 pass
         print(f"[DataCenter] {market.upper()} 行情就绪: {symbol} {len(df)} 根K线(来源 sina)")
+        return df
+
+    def _get_us_hk_intraday(
+        self,
+        symbol: str,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        market: str,
+        timeframe: str,
+    ) -> pd.DataFrame:
+        """美股/港股分钟线(东财, 本机被拦, 阿里云服务器可用), 60分钟 -> 重采样。"""
+        self._require_akshare()
+        start = start_date or self.config.start_date
+        end = end_date or self.config.end_date
+        cache_path = self.paths.cache_dir / f"{market}_{timeframe}_{symbol}_{start}_{end}.parquet"
+        if self.config.use_cache and cache_path.exists():
+            cached = self._read_cache(cache_path, symbol)
+            if cached is not None and not cached.empty:
+                print(f"[DataCenter] 命中缓存: {cache_path.name}")
+                return cached
+        if market == "us":
+            raw = ak.stock_us_hist_min_em(symbol=str(symbol), period="60", adjust="qfq",
+                                          start_date=start, end_date=end)
+        else:
+            raw = ak.stock_hk_hist_min_em(symbol=str(symbol), period="60", adjust="qfq",
+                                          start_date=start, end_date=end)
+        df = self.normalize(raw, code=str(symbol))
+        if timeframe != "60min":
+            agg = {"open": "first", "high": "max", "low": "min", "close": "last",
+                   "volume": "sum", "amount": "sum"}
+            df = df.resample(timeframe).agg(agg).dropna(subset=["close"])
+            df.attrs[UNIFIED_BAR.code_attr] = str(symbol)
+        if self.config.use_cache:
+            try:
+                df.to_parquet(cache_path)
+            except Exception:
+                pass
+        print(f"[DataCenter] {market.upper()} {timeframe} 行情就绪: {symbol} {len(df)} 根(来源 eastmoney)")
         return df
 
     def _get_intraday_bars(
