@@ -42,21 +42,16 @@ MODE_NAMES = {"full": "全仓", "staged": "补仓"}
 
 
 def load_pool(market: str, app: AppConfig) -> list[str]:
-    pools = json.loads((ROOT / "config" / "pools.json").read_text(encoding="utf-8"))
-    if market == "cn":
-        cache = ROOT / "data" / "pool_csi300.csv"
-        if cache.exists():
-            df = pd.read_csv(cache, dtype=str)
-            return [str(c) for c in df["code"]]
-        from qtcore.screener import StockScreener
+    """真实全市场 -> 数据驱动流动性初筛 -> Top-N 池(依据存 pool_<market>_real.csv)。"""
+    pool_file = ROOT / "data" / f"pool_{market}_real.csv"
+    if pool_file.exists():
+        df = pd.read_csv(pool_file, dtype=str)
+        print(f"[Pool] {market.upper()} 使用真实数据池 {len(df)} 只: {pool_file.name}")
+        return df["code"].tolist()
+    from qtcore.universe import build_data_pool
 
-        screener = StockScreener(app, synthetic=False, universe="csi300", use_snapshot=False)
-        cands = screener.filter_universe()
-        codes = [str(c) for c in cands.head(int(pools["cn"]["size"]))["code"]]
-        pd.DataFrame({"code": codes}).to_csv(cache, index=False, encoding="utf-8")
-        return codes
-    symbols = pools[market]["symbols"]
-    return list(dict.fromkeys(symbols))  # 去重保序
+    df = build_data_pool(market, top_n=150)
+    return df["code"].tolist()
 
 
 def sanitize(p: dict[str, Any], market: str, mode: str) -> dict[str, Any]:
@@ -135,6 +130,9 @@ def run_scheme(
         print(f"[{market}/{mode}] 第 {r}/{rounds} 轮: {json.dumps({k: proposal[k] for k in ('fast','slow','timeframe','top_k','position_ratio','entry_ratio','add_trigger_pct','add_ratio','max_adds') if k in proposal}, ensure_ascii=False)}")
 
         scores = evaluator.score_symbols(pool, proposal, *TRAIN_WINDOW)
+        if not scores.empty:
+            # 选股证据: 池内每一只的训练集打分, 证明 Top-K 由全池排序得出
+            scores.to_csv(OUT_DIR / f"scores_{market}_{mode}.csv", index=False)
         if scores.empty or len(scores) < proposal["top_k"]:
             history.append({"role": "user", "content": f"第 {r} 轮标的不足"})
             continue

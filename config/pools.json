@@ -1,21 +1,6 @@
 {
-  "cn": {"source": "csi300", "size": 15},
-  "us": {
-    "symbols": [
-      "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK.B",
-      "JPM", "V", "UNH", "XOM", "LLY", "JNJ", "PG", "MA", "HD", "MRK",
-      "ABBV", "CRM", "ORCL", "AMD", "NFLX", "INTC", "DIS", "KO", "PEP",
-      "COST", "WMT", "BA", "CSCO", "IBM", "MCD", "NKE", "T", "VZ", "CVX",
-      "WFC", "BAC", "GE", "CAT", "AMGN", "PFE", "QCOM", "TXN", "AVGO",
-      "ADBE", "PYPL", "UBER", "SHOP"
-    ]
-  },
-  "hk": {
-    "symbols": [
-      "00700", "09988", "03690", "01810", "00005", "00388", "00939",
-      "01398", "03988", "02318", "00941", "00883", "00981", "09618",
-      "01024", "02020", "09999", "01211", "02331", "01088", "01177",
-      "00386", "02628", "06060", "09633"
-    ]
-  }
+  "note": "股票池不再使用人工名单, 统一由 qtcore/universe.py 从真实全市场列表(SEC/港交所/akshare全A) + 数据驱动流动性初筛生成",
+  "cn": {"source": "full_market"},
+  "us": {"source": "sec_full_market"},
+  "hk": {"source": "hkex_full_market"}
 }
