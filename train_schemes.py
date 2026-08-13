@@ -254,7 +254,7 @@ def main() -> int:
         b = s["best"]
         out_json = OUT_DIR / f"{s['market']}_{s['mode']}.json"
         payload = {k: v for k, v in b.items() if k != "test_returns"}
-        payload["test_returns"] = b["test_returns"].to_dict()
+        payload["test_returns"] = {str(k): v for k, v in b["test_returns"].items()}
         out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         chart_scheme(s)
         summary_rows.append(
