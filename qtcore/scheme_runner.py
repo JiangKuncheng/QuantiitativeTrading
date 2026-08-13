@@ -78,22 +78,79 @@ def _eval_one(
     scheme: dict[str, Any],
     dc: DataCenter,
     d_str: str,
+    prev_equity: float | None = None,
 ) -> dict[str, Any]:
-    """单个方案当日评估: Top-K 等权组合当日收益。"""
+    """
+    单个方案当日评估:
+        - 每个标的按"方案昨日权益 / K"等权分配模拟资金;
+        - 运行 BacktestEngine(收盘出信号 -> 次日开盘价成交, 含滑点/佣金/止损/熔断);
+        - 返回当日收益、今日成交明细(开盘价成交)与收盘持仓快照。
+    """
     top = [str(c) for c in str(scheme.get("top_symbols", "")).split(",") if c]
     market = str(scheme.get("market", "cn"))
     timeframe = str(scheme.get("timeframe", "daily"))
     data_start = INTRADAY_DATA_START if timeframe != "daily" else DATA_START
     app = AppConfig()
-    bt = _bt_config(scheme, app)
+    per_symbol_capital = (prev_equity or INITIAL) / max(1, len(top))
+    trades_today: list[dict[str, Any]] = []
+    positions: list[dict[str, Any]] = []
     rets = []
     for code in top:
         try:
             bars = dc.get_bars(code, data_start, d_str, timeframe, market)
             if bars is None or len(bars) < 60:
                 continue
+            bt = _bt_config(scheme, app)
+            bt.initial_capital = per_symbol_capital
             result = BacktestEngine(bt).run(bars, create_strategy("ma_cross", scheme))
             rets.append(float(result.equity_curve["daily_return"].iloc[-1]))
+
+            # 今日成交: 昨日收盘信号 -> 今日开盘价成交
+            if result.trades is not None and not result.trades.empty:
+                tr = result.trades.copy()
+                tr["date"] = tr["datetime"].dt.date.astype(str)
+                today_tr = tr[tr["date"] == d_str]
+                for _, row in today_tr.iterrows():
+                    trades_today.append(
+                        {
+                            "code": str(row["code"]),
+                            "side": str(row["side"]),
+                            "units": int(row["units"]),
+                            "price": float(row["price"]),
+                            "commission": float(row.get("commission") or 0.0),
+                            "pnl": None if row.get("pnl") is None else float(row["pnl"]),
+                            "reason": str(row.get("reason") or ""),
+                        }
+                    )
+
+            # 收盘持仓快照: 由全历史成交净额还原 + 最新收盘价
+            net: dict[str, dict[str, Any]] = {}
+            for _, row in result.trades.iterrows():
+                c = str(row["code"])
+                side = str(row["side"])
+                units = int(row["units"])
+                price = float(row["price"])
+                e = net.setdefault(c, {"units": 0, "buy_cost": 0.0, "buy_units": 0})
+                if side == "BUY":
+                    e["units"] += units
+                    e["buy_cost"] += units * price
+                    e["buy_units"] += units
+                elif side == "SELL":
+                    e["units"] -= units
+            last_close = float(bars["close"].iloc[-1])
+            for c, e in net.items():
+                if e["units"] <= 0:
+                    continue
+                avg_price = e["buy_cost"] / e["buy_units"] if e["buy_units"] else 0.0
+                positions.append(
+                    {
+                        "code": c,
+                        "units": e["units"],
+                        "avg_price": round(avg_price, 4),
+                        "last_price": round(last_close, 4),
+                        "market_value": round(e["units"] * last_close, 2),
+                    }
+                )
         except Exception as exc:
             print(f"[Scheme] {market}/{code} 评估失败: {exc!r}")
     port_ret = float(pd.Series(rets).mean()) if rets else 0.0
@@ -104,6 +161,8 @@ def _eval_one(
         "top_symbols": ",".join(top),
         "daily_return": port_ret,
         "n_symbols": len(rets),
+        "trades": trades_today,
+        "positions": positions,
     }
 
 
@@ -122,14 +181,18 @@ def run_schemes_daily(
     d_iso = today.strftime("%Y-%m-%d")
     rows = []
     for s in schemes:
-        r = _eval_one(s, dc, d_str)
-        prev = store.prev_scheme_equity(r["scheme"], d_iso) or INITIAL
+        scheme_id = str(s.get("scheme_id") or f"{s.get('market')}_{s.get('position_mode', 'full')}")
+        prev = store.prev_scheme_equity(scheme_id, d_iso) or INITIAL
+        r = _eval_one(s, dc, d_str, prev_equity=prev)
         equity = prev * (1.0 + r["daily_return"])
         r["equity"] = equity
         r["cum_return"] = equity / INITIAL - 1.0
         store.save_scheme_equity(r["scheme"], d_iso, equity, r["daily_return"], r["top_symbols"])
+        store.save_scheme_trades(r["scheme"], d_iso, r.get("trades", []))
+        store.save_scheme_positions(r["scheme"], d_iso, r.get("positions", []))
         rows.append(r)
-        print(f"[Scheme] {r['scheme']}: 当日 {r['daily_return']:+.2%} 累计 {r['cum_return']:+.2%}")
+        op = f", 成交 {len(r.get('trades', []))} 笔, 持仓 {len(r.get('positions', []))} 只"
+        print(f"[Scheme] {r['scheme']}: 当日 {r['daily_return']:+.2%} 累计 {r['cum_return']:+.2%}{op}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     chart_paths = _charts(rows, store)
@@ -185,16 +248,60 @@ def _charts(rows: list[dict[str, Any]], store: Store) -> list[Path]:
 
 
 def _report_text(rows: list[dict[str, Any]]) -> str:
+    def _clean(x: Any) -> Any:
+        """把 NaN 转成 None, 保证 JSON 合法。"""
+        try:
+            if x is not None and x != x:  # NaN
+                return None
+        except Exception:
+            pass
+        return x
+
+    def _deep_clean(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: _deep_clean(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_deep_clean(v) for v in obj]
+        return _clean(obj)
+
+    def _ops(r: dict[str, Any]) -> str:
+        t = r.get("trades", [])
+        if not t:
+            return "无成交"
+        return "; ".join(
+            f"{x['code']} {'买入' if x['side'] == 'BUY' else '卖出'} {x['units']}股@{x['price']:.2f}"
+            for x in t
+        )
+
+    def _pos(r: dict[str, Any]) -> str:
+        p = r.get("positions", [])
+        if not p:
+            return "空仓"
+        return ", ".join(f"{x['code']} {x['units']}股(成本{x['avg_price']:.2f})" for x in p)
+
     table = "\n".join(
-        f"- {r['market'].upper()}-{r['mode']}: 当日 {r['daily_return']:+.2%}, "
-        f"累计 {r['cum_return']:+.2%}, 持仓 {r['top_symbols']}"
+        f"- {r['scheme']}: 当日 {r['daily_return']:+.2%}, 累计 {r['cum_return']:+.2%}, "
+        f"权益 {r['equity']:,.0f}, 今日操作: {_ops(r)}, 收盘持仓: {_pos(r)}"
         for r in rows
     )
+    payload = [
+        {
+            "scheme": r["scheme"],
+            "daily_return": r["daily_return"],
+            "cum_return": r["cum_return"],
+            "equity": r["equity"],
+            "trades_today": r.get("trades", []),
+            "positions": r.get("positions", []),
+        }
+        for r in rows
+    ]
+    detail = json.dumps(_deep_clean(payload), ensure_ascii=False)
     try:
         return _ask(
             "你是量化交易助手, 用简洁中文写六方案日报: 今日各方案表现、哪个最好/最差、"
-            "与昨日相比有无异常、风险提示。约300字, 不构成投资建议。",
-            "六方案今日数据:\n" + table,
+            "今日各方案模拟成交了什么(按昨日信号今日开盘价成交)、当前持仓、风险提示。"
+            "约400字, 不构成投资建议。",
+            "六方案今日数据:\n" + table + "\n详细成交与持仓:\n" + detail,
         )
     except Exception as exc:
-        return "六方案日报(DeepSeek 生成失败):\n" + table + f"\n({exc!r})"
+        return "六方案日报(DeepSeek 生成失败, 结构化摘要):\n" + table + f"\n({exc!r})"

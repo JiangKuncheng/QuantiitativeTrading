@@ -35,6 +35,30 @@ CREATE TABLE IF NOT EXISTS scheme_equity_daily (
     created_at TEXT,
     PRIMARY KEY (scheme, date)
 );
+CREATE TABLE IF NOT EXISTS scheme_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scheme TEXT NOT NULL,
+    date TEXT NOT NULL,
+    code TEXT NOT NULL,
+    side TEXT NOT NULL,
+    units INTEGER,
+    price REAL,
+    commission REAL,
+    pnl REAL,
+    reason TEXT,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS scheme_positions (
+    scheme TEXT NOT NULL,
+    date TEXT NOT NULL,
+    code TEXT NOT NULL,
+    units INTEGER NOT NULL,
+    avg_price REAL,
+    last_price REAL,
+    market_value REAL,
+    created_at TEXT,
+    PRIMARY KEY (scheme, date, code)
+);
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,
@@ -198,6 +222,60 @@ class Store:
             (scheme, date, equity, daily_return, top_symbols, datetime.now().isoformat(timespec="seconds")),
         )
         self.conn.commit()
+
+    def save_scheme_trades(self, scheme: str, date: str, rows: list[dict[str, Any]]) -> None:
+        """保存某方案当日模拟成交(重跑时先清掉当日旧记录, 保证幂等)。"""
+        self.conn.execute(
+            "DELETE FROM scheme_trades WHERE scheme = ? AND date = ?", (scheme, date)
+        )
+        now = datetime.now().isoformat(timespec="seconds")
+        self.conn.executemany(
+            """INSERT INTO scheme_trades
+               (scheme, date, code, side, units, price, commission, pnl, reason, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    scheme, date, r["code"], r.get("side"), r.get("units"),
+                    r.get("price"), r.get("commission"), r.get("pnl"), r.get("reason"), now,
+                )
+                for r in rows
+            ],
+        )
+        self.conn.commit()
+
+    def save_scheme_positions(self, scheme: str, date: str, rows: list[dict[str, Any]]) -> None:
+        """保存某方案当日收盘持仓快照(重跑时先清掉当日旧记录)。"""
+        self.conn.execute(
+            "DELETE FROM scheme_positions WHERE scheme = ? AND date = ?", (scheme, date)
+        )
+        now = datetime.now().isoformat(timespec="seconds")
+        self.conn.executemany(
+            """INSERT INTO scheme_positions
+               (scheme, date, code, units, avg_price, last_price, market_value, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    scheme, date, r["code"], r.get("units", 0), r.get("avg_price"),
+                    r.get("last_price"), r.get("market_value"), now,
+                )
+                for r in rows
+            ],
+        )
+        self.conn.commit()
+
+    def scheme_trades_on(self, scheme: str, date: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM scheme_trades WHERE scheme = ? AND date = ? ORDER BY id",
+            (scheme, date),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def scheme_positions_on(self, scheme: str, date: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM scheme_positions WHERE scheme = ? AND date = ? ORDER BY code",
+            (scheme, date),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def scheme_equity_series(self, scheme: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
