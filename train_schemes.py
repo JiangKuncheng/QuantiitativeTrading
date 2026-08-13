@@ -36,6 +36,10 @@ OUT_DIR = ROOT / "output" / "schemes"
 
 TRAIN_WINDOW = ("20200101", "20221231")
 TEST_WINDOW = ("20240101", "20260810")
+# 日内周期(美股/港股)受免费数据源深度限制: TwelveData 免费档约 2 年小时线,
+# 因此日内训练/测试使用 2024-08 起切分, 保证两个区间不重叠且都在数据覆盖内。
+INTRADAY_TRAIN_WINDOW = ("20240801", "20250801")
+INTRADAY_TEST_WINDOW = ("20250801", "20260813")
 
 MARKET_NAMES = {"cn": "A股", "us": "美股", "hk": "港股"}
 MODE_NAMES = {"full": "全仓", "staged": "补仓"}
@@ -116,10 +120,14 @@ def run_scheme(
     rounds: int,
     tuner: DeepSeekTuner | None,
     force_timeframe: str | None = None,
+    train_window: tuple[str, str] | None = None,
+    test_window: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     app = AppConfig()
     training = TrainingConfig()
     evaluator = PortfolioEvaluator(app, training, synthetic=False)
+    train_window = train_window or TRAIN_WINDOW
+    test_window = test_window or TEST_WINDOW
     history: list[dict[str, str]] = []
     results: list[dict[str, Any]] = []
 
@@ -135,7 +143,7 @@ def run_scheme(
         proposal["position_mode"] = mode
         print(f"[{market}/{mode}] 第 {r}/{rounds} 轮: {json.dumps({k: proposal[k] for k in ('fast','slow','timeframe','top_k','position_ratio','entry_ratio','add_trigger_pct','add_ratio','max_adds') if k in proposal}, ensure_ascii=False)}")
 
-        scores = evaluator.score_symbols(pool, proposal, *TRAIN_WINDOW)
+        scores = evaluator.score_symbols(pool, proposal, *train_window)
         if not scores.empty:
             # 选股证据: 池内每一只的训练集打分, 证明 Top-K 由全池排序得出
             scores.to_csv(OUT_DIR / f"scores_{market}_{mode}.csv", index=False)
@@ -143,9 +151,9 @@ def run_scheme(
             history.append({"role": "user", "content": f"第 {r} 轮标的不足"})
             continue
         top = scores.nlargest(proposal["top_k"], proposal["select_metric"])["code"].tolist()
-        train_pf = evaluator.portfolio_metrics(top, proposal, *TRAIN_WINDOW, "train")
-        test_pf = evaluator.portfolio_metrics(top, proposal, *TEST_WINDOW, "test")
-        test_returns = evaluator.portfolio_returns(top, proposal, *TEST_WINDOW)
+        train_pf = evaluator.portfolio_metrics(top, proposal, *train_window, "train")
+        test_pf = evaluator.portfolio_metrics(top, proposal, *test_window, "test")
+        test_returns = evaluator.portfolio_returns(top, proposal, *test_window)
         score = proposal_score(train_pf)
         results.append(
             {
@@ -263,7 +271,20 @@ def main() -> int:
                 )
                 schemes.append({"market": market, "mode": mode, "best": data})
                 continue
-            scheme = run_scheme(market, mode, pool, args.rounds, tuner, args.force_timeframe)
+            train_window = (
+                INTRADAY_TRAIN_WINDOW
+                if args.force_timeframe and args.force_timeframe != "daily"
+                else TRAIN_WINDOW
+            )
+            test_window = (
+                INTRADAY_TEST_WINDOW
+                if args.force_timeframe and args.force_timeframe != "daily"
+                else TEST_WINDOW
+            )
+            scheme = run_scheme(
+                market, mode, pool, args.rounds, tuner, args.force_timeframe,
+                train_window, test_window,
+            )
             schemes.append(scheme)
             # 立即保存, 支持断点续训
             b = scheme["best"]

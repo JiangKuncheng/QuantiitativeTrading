@@ -36,14 +36,27 @@ ROOT = Path(__file__).resolve().parent.parent
 SCHEMES_DIR = ROOT / "output" / "schemes"
 OUT_DIR = ROOT / "output" / "schemes" / "daily"
 DATA_START = "20200101"
+INTRADAY_DATA_START = "20240801"   # 免费源(如 TwelveData)美股/港股小时线深度约 2 年
 INITIAL = 1_000_000.0
 
 
 def load_schemes() -> list[dict[str, Any]]:
-    """读取训练好的 6 方案配置。"""
+    """读取训练好的方案配置(日线 6 方案 + 美股/港股日内 4 方案)。"""
     schemes = []
-    for f in sorted(SCHEMES_DIR.glob("*_full.json")) + sorted(SCHEMES_DIR.glob("*_staged.json")):
+    patterns = ("*_full.json", "*_staged.json", "*_full_intraday.json", "*_staged_intraday.json")
+    seen: set[str] = set()
+    files: list[Path] = []
+    for pat in patterns:
+        for p in SCHEMES_DIR.glob(pat):
+            if p not in files:
+                files.append(p)
+    for f in sorted(files, key=lambda p: p.name):
         data = json.loads(f.read_text(encoding="utf-8"))
+        scheme_id = Path(f).stem  # 如 us_full / us_full_intraday, 保证日线与日内分账
+        if scheme_id in seen:
+            continue
+        seen.add(scheme_id)
+        data["scheme_id"] = scheme_id
         schemes.append(data)
     return schemes
 
@@ -70,12 +83,13 @@ def _eval_one(
     top = [str(c) for c in str(scheme.get("top_symbols", "")).split(",") if c]
     market = str(scheme.get("market", "cn"))
     timeframe = str(scheme.get("timeframe", "daily"))
+    data_start = INTRADAY_DATA_START if timeframe != "daily" else DATA_START
     app = AppConfig()
     bt = _bt_config(scheme, app)
     rets = []
     for code in top:
         try:
-            bars = dc.get_bars(code, DATA_START, d_str, timeframe, market)
+            bars = dc.get_bars(code, data_start, d_str, timeframe, market)
             if bars is None or len(bars) < 60:
                 continue
             result = BacktestEngine(bt).run(bars, create_strategy("ma_cross", scheme))
@@ -84,7 +98,7 @@ def _eval_one(
             print(f"[Scheme] {market}/{code} 评估失败: {exc!r}")
     port_ret = float(pd.Series(rets).mean()) if rets else 0.0
     return {
-        "scheme": f"{market}_{scheme.get('position_mode', 'full')}",
+        "scheme": str(scheme.get("scheme_id") or f"{market}_{scheme.get('position_mode', 'full')}"),
         "market": market,
         "mode": str(scheme.get("position_mode", "full")),
         "top_symbols": ",".join(top),

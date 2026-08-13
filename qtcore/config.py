@@ -70,6 +70,7 @@ class DataConfig:
     fetch_backoff: float = 2.0      # 重试退避基数(秒), 第 n 次重试等待 n*backoff
     synthetic_days: int = 600       # 合成数据长度
     synthetic_seed: int = 42        # 合成数据随机种子, 保证可复现
+    twelvedata_api_key: str = ""    # TwelveData 免费key, 美股/港股分钟线主源(服务器可用)
 
 
 @dataclass

@@ -29,6 +29,7 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 import time
+import os
 
 try:  # akshare 为可选依赖: 未安装时自动进入合成数据/离线模式
     import akshare as ak
@@ -65,6 +66,7 @@ _AK_COLUMN_MAP: dict[str, str] = {
     "成交额": "amount",
     "date": "datetime",
     "day": "datetime",
+    "datetime": "datetime",
     "open": "open",
     "close": "close",
     "high": "high",
@@ -254,8 +256,13 @@ class DataCenter:
         market: str,
         timeframe: str,
     ) -> pd.DataFrame:
-        """美股/港股分钟线(东财, 本机被拦, 阿里云服务器可用), 60分钟 -> 重采样。"""
-        self._require_akshare()
+        """
+        美股/港股分钟线(多源自动回退):
+            1) TwelveData(1小时线, 免费key, 阿里云/本地均可达, 深度约2年) -> 重采样 2h/4h/6h;
+            2) 东财 K线接口(secid: us=105/106/107, hk=116, 仅网络可达时可用);
+            3) akshare 港股分钟接口(仅 hk, 最后兜底)。
+        统一返回 UnifiedBar(60min 或重采样后的 timeframe)。
+        """
         start = start_date or self.config.start_date
         end = end_date or self.config.end_date
         cache_path = self.paths.cache_dir / f"{market}_{timeframe}_{symbol}_{start}_{end}.parquet"
@@ -264,25 +271,193 @@ class DataCenter:
             if cached is not None and not cached.empty:
                 print(f"[DataCenter] 命中缓存: {cache_path.name}")
                 return cached
-        if market == "us":
-            raw = ak.stock_us_hist_min_em(symbol=str(symbol), period="60", adjust="qfq",
-                                          start_date=start, end_date=end)
-        else:
-            raw = ak.stock_hk_hist_min_em(symbol=str(symbol), period="60", adjust="qfq",
-                                          start_date=start, end_date=end)
-        df = self.normalize(raw, code=str(symbol))
-        if timeframe != "60min":
-            agg = {"open": "first", "high": "max", "low": "min", "close": "last",
-                   "volume": "sum", "amount": "sum"}
-            df = df.resample(timeframe).agg(agg).dropna(subset=["close"])
-            df.attrs[UNIFIED_BAR.code_attr] = str(symbol)
-        if self.config.use_cache:
+
+        errors: list[str] = []
+        # 1) TwelveData: 服务器/本地都可达, 免费key, 1小时线深度约2年
+        if self._twelvedata_key():
             try:
-                df.to_parquet(cache_path)
+                raw = self._fetch_twelvedata_60min(symbol, start, end, market)
+                df = self.normalize(raw, code=str(symbol))
+                df.attrs["source"] = "twelvedata"
+                df = self._resample_intraday(df, symbol, timeframe)
+                df = self._slice(df, self._parse_date(start), self._parse_date(end))
+                self._save_intraday_cache(df, cache_path)
+                print(f"[DataCenter] {market.upper()} {timeframe} 行情就绪: {symbol} {len(df)} 根(来源 twelvedata)")
+                return df
+            except Exception as exc:
+                errors.append(f"twelvedata: {exc!r}")
+
+        # 2) 东财 K线接口直连(secid: us=105/106/107 逐一尝试, hk=116)
+        try:
+            if market == "us":
+                raw = None
+                last_err: Exception | None = None
+                for prefix in ("105", "106", "107"):
+                    try:
+                        probe = self._fetch_em_kline_secid(f"{prefix}.{symbol}", start, end)
+                        if probe is not None and not probe.empty:
+                            raw = probe
+                            break
+                    except Exception as exc:  # noqa: PERF203
+                        last_err = exc
+                if raw is None or raw.empty:
+                    raise RuntimeError(f"eastmoney kline us {symbol}: 无数据 ({last_err!r})")
+            else:
+                raw = self._fetch_em_kline_secid(f"116.{symbol}", start, end)
+            df = self.normalize(raw, code=str(symbol))
+            df.attrs["source"] = "eastmoney_kline"
+            df = self._resample_intraday(df, symbol, timeframe)
+            df = self._slice(df, self._parse_date(start), self._parse_date(end))
+            self._save_intraday_cache(df, cache_path)
+            print(f"[DataCenter] {market.upper()} {timeframe} 行情就绪: {symbol} {len(df)} 根(来源 eastmoney_kline)")
+            return df
+        except Exception as exc:
+            errors.append(f"eastmoney_kline: {exc!r}")
+
+        # 3) akshare 港股分钟接口(仅 hk 兜底)
+        if market == "hk":
+            try:
+                self._require_akshare()
+                raw = ak.stock_hk_hist_min_em(
+                    symbol=str(symbol), period="60", adjust="qfq",
+                    start_date=start, end_date=end,
+                )
+                df = self.normalize(raw, code=str(symbol))
+                df.attrs["source"] = "eastmoney_min_ak"
+                df = self._resample_intraday(df, symbol, timeframe)
+                df = self._slice(df, self._parse_date(start), self._parse_date(end))
+                self._save_intraday_cache(df, cache_path)
+                print(f"[DataCenter] HK {timeframe} 行情就绪: {symbol} {len(df)} 根(来源 eastmoney_min_ak)")
+                return df
+            except Exception as exc:
+                errors.append(f"hk_min_ak: {exc!r}")
+
+        raise RuntimeError(f"{market.upper()} {timeframe} 所有数据源均失败: {symbol}: " + "; ".join(errors))
+
+    # ------------------------------------------------------------------
+    # 美股/港股日内数据源实现
+    # ------------------------------------------------------------------
+    def _twelvedata_key(self) -> str:
+        """TwelveData key: 优先 DataConfig, 其次环境变量 TWELVEDATA_API_KEY。"""
+        if not self.config.twelvedata_api_key and "TWELVEDATA_API_KEY" not in os.environ:
+            try:  # Docker/cron 场景: 代码从 /app/.env 兜底加载
+                from qtcore.dotenv import load_dotenv
+
+                load_dotenv()
             except Exception:
                 pass
-        print(f"[DataCenter] {market.upper()} {timeframe} 行情就绪: {symbol} {len(df)} 根(来源 eastmoney)")
+        return self.config.twelvedata_api_key or os.environ.get("TWELVEDATA_API_KEY", "")
+
+    def _fetch_twelvedata_60min(
+        self, symbol: str, start: str, end: str, market: str
+    ) -> pd.DataFrame:
+        """TwelveData 1小时线: us=AAPL, hk=0700.HK; 返回原始 DataFrame(datetime/open/high/low/close/volume)。"""
+        import requests
+
+        key = self._twelvedata_key()
+        td_symbol = f"{symbol}.HK" if market == "hk" else str(symbol).upper()
+        params = {
+            "symbol": td_symbol,
+            "interval": "1h",
+            "outputsize": "5000",
+            "apikey": key,
+            "start_date": self._to_iso(start),
+            "end_date": self._to_iso(end),
+            "timezone": "Exchange",
+        }
+        last_exc: Exception | None = None
+        for attempt in range(max(1, self.config.fetch_retries)):
+            try:
+                r = requests.get(
+                    "https://api.twelvedata.com/time_series",
+                    params=params, timeout=30,
+                    headers={"User-Agent": "Mozilla/5.0 (QuantitativeTrading)"},
+                )
+                r.raise_for_status()
+                data = r.json()
+                if data.get("status") != "ok":
+                    msg = data.get("message") or data.get("error") or str(data)[:200]
+                    raise RuntimeError(f"twelvedata status={data.get('status')}: {msg}")
+                values = data.get("values") or []
+                if not values:
+                    raise RuntimeError(f"twelvedata 无数据: {td_symbol}")
+                df = pd.DataFrame(values)
+                return df
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(1.0 + attempt * self.config.fetch_backoff)
+        raise RuntimeError(f"TwelveData 拉取失败 {td_symbol}: {last_exc!r}")
+
+    def _fetch_em_kline_secid(
+        self, secid: str, start: str, end: str, retries: int = 3
+    ) -> pd.DataFrame:
+        """东财 K线接口直连(push2his): klt=60(60分钟), 返回原始 DataFrame。"""
+        import requests
+
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "klt": "60",
+            "fqt": "1",
+            "secid": secid,
+            "beg": start.replace("-", ""),
+            "end": end.replace("-", ""),
+            "lmt": "1000000",
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                r = requests.get(url, params=params, timeout=25, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+                klines = (data.get("data") or {}).get("klines") or []
+                if not klines:
+                    return pd.DataFrame()
+                cols = ("datetime", "open", "close", "high", "low",
+                        "volume", "amount", "amplitude", "pct_chg", "chg", "turnover")
+                rows = [dict(zip(cols, k.split(","))) for k in klines]
+                return pd.DataFrame(rows)
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(1.0 + attempt)
+        raise RuntimeError(f"EM kline 拉取失败 {secid}: {last_exc!r}")
+
+    @staticmethod
+    def _to_iso(date_str: str) -> str:
+        """20240101 -> 2024-01-01 (TwelveData 需要 ISO 格式)。"""
+        s = str(date_str).strip().replace("-", "").replace("/", "")
+        if len(s) >= 8 and s[:8].isdigit():
+            return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+        return date_str
+
+    def _resample_intraday(
+        self, df: pd.DataFrame, symbol: str, timeframe: str
+    ) -> pd.DataFrame:
+        """60分钟基础线 -> 目标 timeframe(2h/4h/6h); 60min 则直接返回。"""
+        if timeframe != "60min":
+            agg: dict[str, str] = {"open": "first", "high": "max", "low": "min", "close": "last"}
+            if "volume" in df.columns:
+                agg["volume"] = "sum"
+            if "amount" in df.columns:
+                agg["amount"] = "sum"
+            df = df.resample(timeframe).agg(agg).dropna(subset=["close"])
+            df.attrs[UNIFIED_BAR.code_attr] = str(symbol)
         return df
+
+    def _save_intraday_cache(self, df: pd.DataFrame, cache_path: Path) -> None:
+        """写入 Parquet 缓存(失败静默, 不影响主流程)。"""
+        if not self.config.use_cache:
+            return
+        try:
+            df.to_parquet(cache_path)
+        except Exception:
+            pass
 
     def _get_intraday_bars(
         self,
