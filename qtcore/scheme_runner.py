@@ -134,7 +134,7 @@ def run_schemes_daily(
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     chart_paths = _charts(rows, store)
     report = _report_text(rows)
-    subject = f"[QuantTrader] 六方案日报 {d_iso}"
+    subject = f"[QuantTrader] 六方案模拟日报 {d_iso}"
     if email_cfg and send_email:
         send_email(subject, report, config=email_cfg, attachments=chart_paths)
         store.save_report(d_iso, "schemes_daily", subject, report)

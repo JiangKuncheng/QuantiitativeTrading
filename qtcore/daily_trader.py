@@ -480,40 +480,23 @@ class DailyTrader:
             "note": "账户从 account_start 起新建仓; 建仓日按收盘信号建仓、当日盈亏记0, 次日开始计收益",
         }
         body = write_daily_report(daily_data)
-        attachments: list[Path] = [chart_path] if chart_path else []
+        subject = f"[QuantTrader] 实盘日报 {d_iso}"
+        send_email(
+            subject,
+            body,
+            config=self.email_cfg,
+            attachments=[chart_path] if chart_path else None,
+        )
+        self.store.save_report(d_iso, "daily", subject, body)
+        print(f"[Daily] 实盘日报已发送: {subject}")
 
-        # 六方案每日评估: 不再单独发邮件, 合并进同一封日报(附 6 方案图 + 总对比图)
-        scheme_section = ""
+        # 六方案每日评估 + 独立邮件(附 6 方案图 + 总对比图)
         try:
             from qtcore.scheme_runner import run_schemes_daily
 
-            scheme_result = run_schemes_daily(
-                self.store, self.dc, today, d_str, self.email_cfg,
-                send_email=False,
-            )
-            scheme_rows = scheme_result["rows"]
-            scheme_section = (
-                "\n\n=======================================\n"
-                "【六方案模拟账户日报】\n"
-                "=======================================\n"
-                + scheme_result["report"]
-                + "\n\n今日数据:\n"
-                + "\n".join(
-                    f"- {r['scheme']}: 当日 {r['daily_return']:+.2%}, "
-                    f"累计 {r['cum_return']:+.2%}, 权益 {r['equity']:,.0f}"
-                    for r in scheme_rows
-                )
-            )
-            attachments += scheme_result["charts"]
+            run_schemes_daily(self.store, self.dc, today, d_str, self.email_cfg)
         except Exception as exc:
-            print(f"[Daily] 六方案评估失败(不影响主日报): {exc!r}")
-            scheme_section = f"\n\n【六方案模拟账户评估失败】{exc!r}"
-
-        body = body + scheme_section
-        subject = f"[QuantTrader] 日报 {d_iso}(实盘+六方案)"
-        send_email(subject, body, config=self.email_cfg, attachments=attachments or None)
-        self.store.save_report(d_iso, "daily", subject, body)
-        print(f"[Daily] 日报已发送: {subject} (附 {len(attachments)} 张图)")
+            print(f"[Daily] 六方案日报生成失败(不影响实盘日报): {exc!r}")
 
         # 5) 周报 / 月报
         if force_weekly or self._is_last_trading_day_of_week(today):
