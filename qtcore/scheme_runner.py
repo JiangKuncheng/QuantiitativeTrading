@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCHEMES_DIR = ROOT / "output" / "schemes"
 OUT_DIR = ROOT / "output" / "schemes" / "daily"
 DATA_START = "20200101"
+SCHEME_DATA_START = "20240101"   # 六方案评估起点: 与训练测试窗口一致(2024起重新起跑), 避免2021-2023熔断状态永久带入
 INTRADAY_DATA_START = "20240801"   # 免费源(如 TwelveData)美股/港股小时线深度约 2 年
 INITIAL = 1_000_000.0
 
@@ -89,7 +90,7 @@ def _eval_one(
     top = [str(c) for c in str(scheme.get("top_symbols", "")).split(",") if c]
     market = str(scheme.get("market", "cn"))
     timeframe = str(scheme.get("timeframe", "daily"))
-    data_start = INTRADAY_DATA_START if timeframe != "daily" else DATA_START
+    data_start = INTRADAY_DATA_START if timeframe != "daily" else SCHEME_DATA_START
     app = AppConfig()
     per_symbol_capital = (prev_equity or INITIAL) / max(1, len(top))
     trades_today: list[dict[str, Any]] = []
