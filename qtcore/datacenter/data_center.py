@@ -176,7 +176,7 @@ class DataCenter:
 
         # 3) 写入缓存: 仅真实数据落缓存, 合成降级数据绝不入缓存,
         #    避免污染真实标的的缓存(否则下次运行会命中"假数据")
-        if use_cache and source != "synthetic":
+        if use_cache and source != "synthetic" and not df.empty:
             try:
                 self._write_cache(df, cache_path)
             except Exception as exc:
@@ -240,7 +240,7 @@ class DataCenter:
         df = self.normalize(raw, code=str(symbol))
         df.attrs["source"] = f"sina_{market}"
         df = self._slice(df, self._parse_date(start), self._parse_date(end))
-        if self.config.use_cache:
+        if self.config.use_cache and not df.empty:
             try:
                 df.to_parquet(cache_path)
             except Exception:
@@ -452,7 +452,7 @@ class DataCenter:
 
     def _save_intraday_cache(self, df: pd.DataFrame, cache_path: Path) -> None:
         """写入 Parquet 缓存(失败静默, 不影响主流程)。"""
-        if not self.config.use_cache:
+        if not self.config.use_cache or df is None or df.empty:
             return
         try:
             df.to_parquet(cache_path)
@@ -617,6 +617,9 @@ class DataCenter:
             try:
                 raw = fetcher()
                 df = self.normalize(raw, code=symbol)
+                if df is None or df.empty:
+                    errors.append(f"{name}: empty data, try next source")
+                    continue
                 df.attrs["source"] = name
                 return df
             except Exception as exc:
