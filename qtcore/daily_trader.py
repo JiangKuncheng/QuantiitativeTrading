@@ -339,15 +339,15 @@ class DailyTrader:
                 f"今日行情数据未发布/延迟: 过期标的 {len(stale)}/{len(pool)}, 示例 {stale[:5]}"
             )
 
-        # 2) 组合与基准
+        # 2) 策略参考口径 + 基准
+        #    等权组合收益链只作参考, 不再驱动账户权益: 账户权益一律等于
+        #    "现金 + 持仓市值", 全系统只有一本账(此前两套口径互不相干)。
         ret_df = pd.DataFrame(returns).fillna(0.0)
         port_ret = ret_df.mean(axis=1)
-        # 记账链: 昨日账户权益(数据库) × (1 + 今日组合收益)
-        today_bt_return = float(port_ret.iloc[-1])
-        prev_equity = self.store.prev_equity_before(d_iso) or float(self.cfg["initial_capital"])
-        today_equity = prev_equity * (1.0 + today_bt_return)
-        daily_return = today_bt_return
-        strategy_total = today_equity / float(self.cfg["initial_capital"]) - 1.0
+        strategy_day_return = float(port_ret.iloc[-1])
+        initial_capital = float(self.cfg["initial_capital"])
+        prev_equity = self.store.prev_equity_before(d_iso) or initial_capital
+        strategy_equity = prev_equity * (1.0 + strategy_day_return)
 
         bench_df = self.dc.get_index_daily(
             str(self.cfg.get("benchmark", "000300")), self.cfg["data_start"], d_str
@@ -363,7 +363,21 @@ class DailyTrader:
         bench_close = bench_df["close"].reindex(port_ret.index).ffill()
         bench_ret = bench_close.pct_change()
         benchmark_return = float(bench_ret.iloc[-1]) if not np.isnan(bench_ret.iloc[-1]) else 0.0
-        benchmark_total = float(bench_close.iloc[-1] / bench_close.iloc[0] - 1.0) if len(bench_close) > 1 else 0.0
+        # 基准累计收益必须与账户同起点(account_start)。
+        # 历史 bug: 这里用 bench_close.iloc[0](= data_start, 2020-01-01)做基准, 于是
+        # 拿"2020 年以来"的指数涨幅去比"建仓以来"的账户收益, 日报里凭空多出十几个
+        # 百分点的落后(账户 -8.14% 被写成落后基准 15.6 个点, 实际只落后约 3 个点)。
+        acc_start = str(self.cfg.get("account_start", d_str))
+        acc_start_iso = f"{acc_start[:4]}-{acc_start[4:6]}-{acc_start[6:]}"
+        base_slice = bench_close[bench_close.index <= pd.Timestamp(acc_start_iso)]
+        bench_base = (
+            float(base_slice.iloc[-1]) if len(base_slice) else float(bench_close.iloc[0])
+        )
+        benchmark_total = (
+            float(bench_close.iloc[-1] / bench_base - 1.0)
+            if len(bench_close) > 1 and bench_base
+            else 0.0
+        )
 
         # 回测成交按账户口径重算股数:
         #   买入预算 = min(仓位上限 - 在手仓位成本, 可用现金), 再等分给当日买入标的。
@@ -437,25 +451,31 @@ class DailyTrader:
                         }
                     )
             today_trades = build_trades
-            # 持仓口径与账户一致: 用实际建仓股数覆盖回测口径
-            for t in build_trades:
-                code = t["code"]
-                if code in holdings:
-                    holdings[code]["units"] = t["units"]
-                    holdings[code]["last_close"] = t["price"]
-                    holdings[code]["value"] = round(t["units"] * t["price"], 2)
-            today_equity = float(self.cfg["initial_capital"])
-            prev_equity = today_equity
-            daily_return = 0.0
-            strategy_total = 0.0
+        # 3) 先落成交, 再按账户口径算权益(唯一口径)
+        self.store.save_trades(today_trades)
+        self.store.save_signals(d_iso, targets, params)
+        # 持仓一律以账户成交记录为准(账户口径), 不用回测全仓口径
+        holdings = self.store.holdings_net()
+        for code, h in holdings.items():
+            if code in last_close_prices:
+                h["last_close"] = last_close_prices[code]
+                h["value"] = round(h["units"] * last_close_prices[code], 2)
 
-        # 3) 落库
+        account_cash = self.store.cash_net(initial_capital)
+        position_value = round(
+            sum(float(h.get("value") or 0.0) for h in holdings.values()), 2
+        )
+        today_equity = round(account_cash + position_value, 2)
+        daily_return = (today_equity / prev_equity - 1.0) if prev_equity else 0.0
+        strategy_total = today_equity / initial_capital - 1.0
+
+        # 4) 落库: equity / cash / position_value 三者恒等, 只此一本账
         self.store.save_equity(
             {
                 "date": d_iso,
-                "equity": round(today_equity, 2),
-                "cash": None,
-                "position_value": None,
+                "equity": today_equity,
+                "cash": round(account_cash, 2),
+                "position_value": position_value,
                 "daily_return": round(daily_return, 6),
                 "benchmark_return": round(benchmark_return, 6),
                 "strategy_total": round(strategy_total, 6),
@@ -464,16 +484,7 @@ class DailyTrader:
         )
         # 账户层熔断状态机(基于建仓以来的权益链, 不套历史回撤)
         halted = self._account_halt_check(today, d_iso, params)
-        self.store.save_trades(today_trades)
-        self.store.save_signals(d_iso, targets, params)
-        # 持仓一律以账户成交记录为准(账户口径), 不再用回测全仓口径
-        holdings = self.store.holdings_net()
-        for code, h in holdings.items():
-            if code in last_close_prices:
-                h["last_close"] = last_close_prices[code]
-                h["value"] = round(h["units"] * last_close_prices[code], 2)
-
-        self._reconcile_account(d_iso, today_equity, holdings, params)
+        self._reconcile_account(d_iso, today_equity, holdings, params, strategy_equity)
         # 生成明日交易计划(供次日 9:20 执行 / 模拟模式 16:00 回放)
         tomorrow_plan = self._save_tomorrow_plan(today, params, targets, holdings, halted)
         self.store.log_run(d_iso, "daily", "ok", f"equity={today_equity:.2f}")
@@ -551,34 +562,45 @@ class DailyTrader:
         today_equity: float,
         holdings: dict[str, dict[str, Any]],
         params: dict[str, Any],
+        strategy_equity: float | None = None,
     ) -> dict[str, float]:
         """
-        账户口径对账: 把"现金 + 持仓市值"落库, 并与"策略权益链"比对。
+        一本账的不变式校验。
 
-        权益链(equity_daily.equity) = 昨日权益 x 当日组合收益, 由回测收益率驱动,
-        与现金/持仓无关; "现金 + 持仓市值"才是账户实际口径。两者长期跑偏即说明两本账
-        脱节 —— 历史 bug 正是持仓堆到 194.9 万而权益链永远是 94 万, 看起来一切正常。
+        账户权益 = 现金 + 持仓市值, 三者落在同一行里必须恒等; 任何一处算错都不能
+        悄悄过去。历史 bug 正是"权益链"和"现金/持仓"各算各的: 持仓堆到 194.9 万,
+        权益还稳稳显示 94 万, 谁也发现不了。
+
+        strategy_equity 是等权组合收益链的参考值, 只记录不告警 —— 账户会留现金,
+        与满仓等权组合本来就有差异。
         """
         initial_capital = float(self.cfg["initial_capital"])
         account_cash = self.store.cash_net(initial_capital)
         position_value = round(
             sum(float(h.get("value") or 0.0) for h in holdings.values()), 2
         )
+        account_equity = round(account_cash + position_value, 2)
         self.store.update_equity_account(d_iso, account_cash, position_value)
-        account_equity = account_cash + position_value
-        drift = (account_equity / today_equity - 1.0) if today_equity else 0.0
+
+        book_gap = abs(account_equity - float(today_equity))
         position_ceiling = initial_capital * float(params.get("max_position_ratio", 1.0))
-        detail = (
-            f"现金{account_cash:,.2f} + 持仓{position_value:,.2f} = {account_equity:,.2f}; "
-            f"策略权益链 {today_equity:,.2f}; 偏离 {drift:+.2%}"
+        reference = (
+            f"; 策略参考口径 {strategy_equity:,.2f}(仅参考)" if strategy_equity else ""
         )
-        if position_value > position_ceiling + 1e-6:
+        detail = (
+            f"现金{account_cash:,.2f} + 持仓{position_value:,.2f} = {account_equity:,.2f}"
+            f"{reference}"
+        )
+        if book_gap > 1.0:
+            reason = (
+                f"落库权益 {float(today_equity):,.2f} 与账户口径 {account_equity:,.2f} 不一致"
+            )
+            print(f"[Daily] 警告: {reason} | {detail}")
+            self.store.log_run(d_iso, "reconcile", "error", f"{reason}; {detail}")
+        elif position_value > position_ceiling + 1e-6:
             reason = f"持仓市值 {position_value:,.2f} 超过上限 {position_ceiling:,.2f}"
             print(f"[Daily] 警告: {reason} | {detail}")
             self.store.log_run(d_iso, "reconcile", "error", f"{reason}; {detail}")
-        elif abs(drift) > 0.02:
-            print(f"[Daily] 警告: 账户口径与策略权益链偏离过大 | {detail}")
-            self.store.log_run(d_iso, "reconcile", "warn", detail)
         else:
             print(f"[Daily] 对账正常 | {detail}")
             self.store.log_run(d_iso, "reconcile", "ok", detail)
@@ -586,7 +608,7 @@ class DailyTrader:
             "cash": account_cash,
             "position_value": position_value,
             "account_equity": account_equity,
-            "drift": drift,
+            "book_gap": book_gap,
         }
 
     def _save_tomorrow_plan(
