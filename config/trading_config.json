@@ -16,7 +16,7 @@
       "top_k": 6,
       "select_metric": "sharpe",
       "position_ratio": 0.95,
-      "max_position_ratio": 1.0,
+      "max_position_ratio": 0.4,
       "rebalance": "daily",
       "order_type": "market",
       "slippage_tolerance_pct": 0.0,

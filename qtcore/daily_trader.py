@@ -353,16 +353,24 @@ class DailyTrader:
             str(self.cfg.get("benchmark", "000300")), self.cfg["data_start"], d_str
         )
         # 基准指数仅用于日报对比, 若数据源延迟则降级为最近可用数据并注明, 不阻塞结算
+        bench_last_day = bench_df.index[-1].strftime("%Y-%m-%d")
         benchmark_note = ""
-        if bench_df.index[-1].strftime("%Y-%m-%d") < d_iso:
+        if bench_last_day < d_iso:
             benchmark_note = (
-                f"基准指数最新数据为 {bench_df.index[-1].strftime('%Y-%m-%d')}"
-                f"(未更新到今日), 大盘对比使用最近可用数据"
+                f"基准指数最新数据为 {bench_last_day}(未更新到今日), "
+                f"当日涨跌采用该交易日数据"
             )
             print(f"[Daily] 警告: {benchmark_note}")
+        # 当日涨跌必须取指数自己最新一天的收益。
+        # 历史 bug: 先对指数做 reindex+ffill 再取 pct_change, 数据延迟那天就被抹成
+        # 0.00%, 日报于是写成"今日大盘 0.00%" —— 等于什么都没说。
+        bench_ret_full = bench_df["close"].pct_change()
+        benchmark_return = (
+            float(bench_ret_full.iloc[-1]) if len(bench_ret_full) > 1 else 0.0
+        )
+        if np.isnan(benchmark_return):
+            benchmark_return = 0.0
         bench_close = bench_df["close"].reindex(port_ret.index).ffill()
-        bench_ret = bench_close.pct_change()
-        benchmark_return = float(bench_ret.iloc[-1]) if not np.isnan(bench_ret.iloc[-1]) else 0.0
         # 基准累计收益必须与账户同起点(account_start)。
         # 历史 bug: 这里用 bench_close.iloc[0](= data_start, 2020-01-01)做基准, 于是
         # 拿"2020 年以来"的指数涨幅去比"建仓以来"的账户收益, 日报里凭空多出十几个
@@ -390,11 +398,19 @@ class DailyTrader:
             buys = [t for t in today_trades if t["side"] in ("BUY", "SELL_SHORT")]
             sells = [t for t in today_trades if t["side"] not in ("BUY", "SELL_SHORT")]
             sold_codes = {t["code"] for t in sells}
-            budget_total = self._buy_budget(prev_equity, bt_cfg, actual_holdings, sold_codes, sells)
-            budget_each = budget_total / max(len(buys), 1)
+            budgets = self._buy_budgets(
+                prev_equity,
+                bt_cfg,
+                actual_holdings,
+                sold_codes,
+                sells,
+                [t["code"] for t in buys],
+            )
             for t in today_trades:
                 if t["side"] in ("BUY", "SELL_SHORT"):
-                    t["units"] = int(budget_each / (t["price"] * lot)) * lot
+                    t["units"] = (
+                        int(budgets.get(t["code"], 0.0) / (t["price"] * lot)) * lot
+                    )
                     t["pnl"] = None
                 else:
                     t["units"] = min(
@@ -424,17 +440,20 @@ class DailyTrader:
             build_codes = [code for code, h in holdings.items() if targets.get(code) == 1]
             bt_cfg = self._bt_config(params)
             if build_codes:
-                # 首日等权建仓: 总预算取 "本金 x 仓位比例" 与可用现金的较小值
-                build_budget = min(
-                    float(self.cfg["initial_capital"]) * bt_cfg.position_ratio,
-                    max(0.0, self.store.cash_net(float(self.cfg["initial_capital"]))),
+                # 首日等权建仓: 走同一套预算规则(总仓位上限 + 单票上限 + 现金约束)
+                build_budgets = self._buy_budgets(
+                    float(self.cfg["initial_capital"]),
+                    bt_cfg,
+                    {},
+                    set(),
+                    [],
+                    build_codes,
                 )
-                budget_each = build_budget / len(build_codes)
                 for code in build_codes:
                     h = holdings[code]
                     price = h["last_close"]
                     lot = self.app.backtest.lot_size
-                    units = int(budget_each / (price * lot)) * lot
+                    units = int(build_budgets.get(code, 0.0) / (price * lot)) * lot
                     if units <= 0:
                         continue
                     build_trades.append(
@@ -511,6 +530,7 @@ class DailyTrader:
             "today_profit": round(today_equity - prev_equity, 2),
             "today_return": f"{daily_return:.2%}",
             "benchmark_return_today": f"{benchmark_return:.2%}",
+            "benchmark_date": bench_last_day,
             "cumulative_return_since_start": f"{strategy_total:.2%}",
             "benchmark_since_start": f"{benchmark_total:.2%}",
             "benchmark_note": benchmark_note,
@@ -731,38 +751,57 @@ class DailyTrader:
             return True
         return False
 
-    def _buy_budget(
+    def _buy_budgets(
         self,
         prev_equity: float,
         bt_cfg: Any,
         holdings: dict[str, dict[str, Any]],
         sold_codes: set[str],
         sells: list[dict[str, Any]],
-    ) -> float:
+        buy_codes: list[str],
+    ) -> dict[str, float]:
         """
-        当日可用于买入的总预算(账户口径)。
+        为当日每个买入标的分配预算, 三重约束取最小:
 
-        约束一(仓位上限): 总权益 x position_ratio 扣除当日不卖出的在手仓位成本;
-        约束二(现金硬约束): 账户现金 + 当日卖出回款(均按含佣金口径折算)。
+        1) 组合总仓位: 总权益 x position_ratio      - 当日不卖出的在手仓位成本
+        2) 单票集中度: 总权益 x max_position_ratio  - 该票在手成本
+        3) 现金硬约束: 账户现金 + 当日卖出回款(含佣金折算)
 
-        两个约束缺一不可: 只看仓位上限会忽略"仓位已满但没钱", 只看现金会忽略
-        "钱够但仓位已超上限"。
+        历史 bug 只算了"总权益 x position_ratio / 买入只数": 既不看在手仓位, 也不看
+        现金, 更没有单票上限 —— 美的集团因此一度占掉账户权益的 94%。
         """
-        retained_cost = sum(
-            float(h.get("units", 0)) * float(h.get("avg_cost") or 0.0)
+        initial_capital = float(self.cfg.get("initial_capital", 1_000_000))
+        retained_cost = {
+            code: float(h.get("units", 0)) * float(h.get("avg_cost") or 0.0)
             for code, h in holdings.items()
             if code not in sold_codes
+        }
+        total_headroom = max(
+            0.0, prev_equity * bt_cfg.position_ratio - sum(retained_cost.values())
         )
-        cash = self.store.cash_net(float(self.cfg.get("initial_capital", 1_000_000)))
-        cash += sum(
+        cash_available = self.store.cash_net(initial_capital) + sum(
             float(t["units"]) * float(t["price"]) * (1.0 - bt_cfg.commission_rate)
             for t in sells
         )
-        position_headroom = prev_equity * bt_cfg.position_ratio - retained_cost
-        return max(
-            0.0,
-            min(position_headroom, max(0.0, cash) / (1.0 + bt_cfg.commission_rate)),
-        )
+        cash_available = max(0.0, cash_available) / (1.0 + bt_cfg.commission_rate)
+        total_headroom = min(total_headroom, cash_available)
+        if not buy_codes:
+            return {}
+
+        share = total_headroom / len(buy_codes)
+        budgets: dict[str, float] = {}
+        for code in buy_codes:
+            single_headroom = max(
+                0.0,
+                prev_equity * bt_cfg.max_position_ratio - retained_cost.get(code, 0.0),
+            )
+            budgets[code] = min(share, single_headroom)
+            if budgets[code] <= 0:
+                print(
+                    f"[Daily] {code} 不建仓: 单票上限 "
+                    f"{bt_cfg.max_position_ratio:.0%} 已用满"
+                )
+        return budgets
 
     def execute_plan(
         self,
@@ -840,14 +879,16 @@ class DailyTrader:
             }
             for p in sells
         ]
-        budget_total = self._buy_budget(prev_equity, bt_cfg, actual_holdings, sold_codes, sell_rows)
-        budget_each = budget_total / max(len(buys), 1)
+        budgets = self._buy_budgets(
+            prev_equity, bt_cfg, actual_holdings, sold_codes, sell_rows,
+            [p["code"] for p in buys],
+        )
         fills: list[dict[str, Any]] = []
 
         for p in needed:
             price = got[p["code"]]
             if p["action"] == "BUY":
-                units = int(budget_each / (price * lot)) * lot
+                units = int(budgets.get(p["code"], 0.0) / (price * lot)) * lot
             else:
                 # 卖出不得超过实际持仓(计划里的股数可能已过期)
                 units = min(

@@ -225,12 +225,15 @@ class AccountReconcileTest(unittest.TestCase):
 
     def test_reconcile_ok_persists_cash_and_position(self) -> None:
         holdings = {"000001": {"units": 1000, "value": 200_000.0}}
+        # 一本账: 落库权益必须等于 现金 + 持仓市值
         out = self.trader._reconcile_account(
-            "2026-09-18", 1_000_000.0, holdings, {"max_position_ratio": 1.0}
+            "2026-09-18", 999_940.0, holdings, {"max_position_ratio": 1.0},
+            strategy_equity=1_000_000.0,
         )
         self.assertAlmostEqual(out["cash"], 799_940.0, places=2)
         self.assertAlmostEqual(out["position_value"], 200_000.0, places=2)
         self.assertAlmostEqual(out["account_equity"], 999_940.0, places=2)
+        self.assertAlmostEqual(out["book_gap"], 0.0, places=2)
 
         row = self.trader.store.conn.execute(
             "SELECT cash, position_value FROM equity_daily WHERE date = '2026-09-18'"
@@ -243,18 +246,97 @@ class AccountReconcileTest(unittest.TestCase):
         """持仓市值突破本金必须报 error —— 这正是历史 bug 的形态。"""
         holdings = {"000001": {"units": 1000, "value": 1_500_000.0}}
         self.trader._reconcile_account(
-            "2026-09-18", 1_000_000.0, holdings, {"max_position_ratio": 1.0}
+            "2026-09-18", 2_299_940.0, holdings, {"max_position_ratio": 1.0}
         )
         status, detail = self._last_status()
         self.assertEqual(status, "error")
         self.assertIn("超过上限", detail)
 
-    def test_reconcile_warns_on_large_drift(self) -> None:
+    def test_reconcile_flags_book_inconsistency(self) -> None:
+        """落库权益与"现金+持仓"对不上必须报 error。"""
         holdings = {"000001": {"units": 1000, "value": 200_000.0}}
         self.trader._reconcile_account(
-            "2026-09-18", 1_500_000.0, holdings, {"max_position_ratio": 1.0}
+            "2026-09-18", 1_000_000.0, holdings, {"max_position_ratio": 1.0}
         )
-        self.assertEqual(self._last_status()[0], "warn")
+        status, detail = self._last_status()
+        self.assertEqual(status, "error")
+        self.assertIn("不一致", detail)
+
+
+class BuyBudgetTest(unittest.TestCase):
+    """买入预算: 组合总仓位 / 单票集中度 / 现金 三重约束。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.trader = DailyTrader.__new__(DailyTrader)
+        self.trader.cfg = {"initial_capital": 1_000_000}
+        self.trader.store = Store(Path(self.tmp.name) / "trading.db")
+        self.addCleanup(self.trader.store.close)
+
+        bt = AppConfig().backtest
+        bt.position_ratio = 0.95
+        bt.max_position_ratio = 0.4
+        self.bt = bt
+
+    def test_single_name_cap_binds(self) -> None:
+        """单票上限 40%: 预算被压到 40 万, 而不是 95 万。"""
+        budgets = self.trader._buy_budgets(
+            1_000_000.0, self.bt, {}, set(), [], ["000001"]
+        )
+        self.assertAlmostEqual(budgets["000001"], 400_000.0, places=2)
+
+    def test_total_cap_is_shared_across_names(self) -> None:
+        """6 个标的时是总仓位 95% 在起作用(95/6 = 15.8% < 单票上限 40%)。"""
+        budgets = self.trader._buy_budgets(
+            1_000_000.0,
+            self.bt,
+            {},
+            set(),
+            [],
+            ["000001", "000002", "000003", "000004", "000005", "000006"],
+        )
+        self.assertAlmostEqual(budgets["000001"], 950_000.0 / 6, places=2)
+        self.assertAlmostEqual(sum(budgets.values()), 950_000.0, places=2)
+
+    def test_single_cap_binds_on_every_name(self) -> None:
+        """2 个标的时单票上限 40% 各自生效(2 x 40% < 95%)。"""
+        budgets = self.trader._buy_budgets(
+            1_000_000.0, self.bt, {}, set(), [], ["000001", "000002"]
+        )
+        self.assertAlmostEqual(budgets["000001"], 400_000.0, places=2)
+        self.assertAlmostEqual(budgets["000002"], 400_000.0, places=2)
+
+    def test_retained_position_consumes_headroom(self) -> None:
+        """已有仓位占用预算: 单票已用满 40% 则不再加仓。"""
+        holdings = {"000001": {"units": 4000, "avg_cost": 100.0}}  # 成本 40 万
+        budgets = self.trader._buy_budgets(
+            1_000_000.0, self.bt, holdings, set(), [], ["000001"]
+        )
+        self.assertAlmostEqual(budgets["000001"], 0.0, places=2)
+
+    def test_cash_binds_when_below_headroom(self) -> None:
+        """现金不足时以现金为准。"""
+        self.trader.store.save_trades(
+            [
+                {
+                    "date": "2026-09-18",
+                    "code": "000009",
+                    "name": "测试",
+                    "side": "BUY",
+                    "units": 1000,
+                    "price": 800.0,
+                    "commission": 0.0,
+                    "pnl": None,
+                    "reason": "open_long",
+                }
+            ]
+        )
+        budgets = self.trader._buy_budgets(
+            1_000_000.0, self.bt, {}, set(), [], ["000001"]
+        )
+        # 现金仅剩 20 万, 低于单票上限 40 万
+        self.assertAlmostEqual(budgets["000001"], 200_000.0 / 1.0003, places=1)
 
 
 if __name__ == "__main__":
