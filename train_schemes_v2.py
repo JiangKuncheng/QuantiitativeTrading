@@ -224,8 +224,23 @@ def train_one_scheme(
             raise RuntimeError(f"{market}/{mode} 所有轮次均无有效候选")
 
         ranked = sorted(candidates, key=lambda x: x["coarse"]["score"], reverse=True)
-        finalists = ranked[:full_top]
-        print(f"\n  粗筛前 {len(finalists)} 名进入全池完整评估...", flush=True)
+        # 去重: LLM 经常提出完全相同的参数, 没必要重复做全池评估
+        seen_keys: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for cand in ranked:
+            key = json.dumps(
+                {k: v for k, v in cand.items() if k != "coarse"}, sort_keys=True
+            )
+            if key not in seen_keys:
+                seen_keys.add(key)
+                deduped.append(cand)
+        # full_top <= 0 表示"全部候选都做全池评估"(不再靠粗筛淘汰)
+        finalists = deduped if full_top <= 0 else deduped[:full_top]
+        print(
+            f"\n  {len(finalists)} 个候选进入全池完整评估"
+            f" (去重前 {len(ranked)} 个)...",
+            flush=True,
+        )
 
         finals: list[dict[str, Any]] = []
         for i, cand in enumerate(finalists, 1):
