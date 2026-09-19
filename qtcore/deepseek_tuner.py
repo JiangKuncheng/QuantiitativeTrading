@@ -40,17 +40,20 @@ SYSTEM_PROMPT = """你是资深量化研究员, 正在为 A 股"双均线交叉 
   "top_k": 3~10(整数, 选股持仓数量),
   "select_metric": "sharpe"或"total_return"或"profit_factor"(选股排序指标),
   "position_ratio": 0.1~1.0(单次建仓资金比例),
-  "max_position_ratio": 0.2~1.0(单标的持仓上限, 控制集中度),
+  "max_position_ratio": 0.2~1.0(组合总仓位上限: 本模型按"每只标的独立满额回测、
+      收益等权平均"计算, 因此该参数等价于"所有持仓标的仓位之和"的上限。调大=更激进,
+      调小=更保守。注意它不是"单只股票最多占多少" —— 单只的实际权重还要再除以持仓只数),
   "rebalance": "daily"/"weekly"/"monthly"(调仓周期),
   "order_type": "market"/"limit"(订单类型),
-  "slippage_tolerance_pct": 0.0~0.01(滑点容忍, 0=不限制),
   "leverage": 1.0~2.0(杠杆),
   "stop_loss_pct": 0.0~0.2(单笔止损, 0=关闭),
   "take_profit_pct": 0.0~0.5(单笔止盈, 0=关闭),
   "max_drawdown_halt": 0.0~0.3(账户回撤熔断, 0=关闭),
-  "halt_cooldown_days": 0~20(整数, 熔断后强制空仓的交易日数),
-  "halt_resume_drawdown": 0.0~0.2(熔断恢复阈值: 回撤回到该比例以内才允许重新建仓)
+  "halt_cooldown_days": 0~20(整数, 熔断后强制空仓的交易日数; 冷却期满即恢复交易)
 }
+
+注意: entry_ratio / add_trigger_pct / add_ratio / max_adds 这四个参数只在"补仓(staged)"
+方案里生效, 全仓(full)方案提交它们会被忽略。
 
 【评估口径】每轮给你: 提案 JSON -> 训练集组合绩效(等权 Top-K: 总收益/年化/夏普/回撤/胜率/盈亏比/覆盖率)。
 注意: 胜率低但盈亏比高是趋势策略的正常形态; 优先提升夏普与降低回撤, 不要只看收益;

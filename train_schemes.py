@@ -93,18 +93,26 @@ def sanitize(p: dict[str, Any], market: str, mode: str, force_timeframe: str | N
         "order_type": p.get("order_type", "market")
         if p.get("order_type", "market") in ("market", "limit")
         else "market",
-        "slippage_tolerance_pct": float(cl(p.get("slippage_tolerance_pct", 0.0), 0.0, 0.01)),
         "leverage": float(cl(p.get("leverage", 1.0), 1.0, 2.0)),
         "stop_loss_pct": float(cl(p.get("stop_loss_pct", 0.0), 0.0, 0.2)),
         "take_profit_pct": float(cl(p.get("take_profit_pct", 0.0), 0.0, 0.5)),
         "max_drawdown_halt": float(cl(p.get("max_drawdown_halt", 0.0), 0.0, 0.3)),
         "halt_cooldown_days": int(cl(p.get("halt_cooldown_days", 0), 0, 20)),
-        "halt_resume_drawdown": float(cl(p.get("halt_resume_drawdown", 0.0), 0.0, 0.2)),
-        "entry_ratio": float(cl(p.get("entry_ratio", 0.5), 0.2, 0.8)),
-        "add_trigger_pct": float(cl(p.get("add_trigger_pct", 0.05), 0.02, 0.15)),
-        "add_ratio": float(cl(p.get("add_ratio", 0.5), 0.2, 0.8)),
-        "max_adds": int(cl(p.get("max_adds", 1), 0, 3)),
     }
+
+    # RSI 阈值只在启用 RSI 过滤时才进入搜索空间, 否则是三个死维度
+    if out["use_rsi"]:
+        out["rsi_window"] = int(cl(p.get("rsi_window", 14), 5, 30))
+        out["rsi_buy"] = float(cl(p.get("rsi_buy", 40.0), 20.0, 45.0))
+        out["rsi_sell"] = float(cl(p.get("rsi_sell", 60.0), 55.0, 85.0))
+
+    # 补仓参数只对 staged 方案有意义(full 方案走不到那条分支)
+    if mode == "staged":
+        out["entry_ratio"] = float(cl(p.get("entry_ratio", 0.5), 0.2, 0.8))
+        out["add_trigger_pct"] = float(cl(p.get("add_trigger_pct", 0.05), 0.02, 0.15))
+        out["add_ratio"] = float(cl(p.get("add_ratio", 0.5), 0.2, 0.8))
+        out["max_adds"] = int(cl(p.get("max_adds", 1), 0, 3))
+
     return out
 
 
