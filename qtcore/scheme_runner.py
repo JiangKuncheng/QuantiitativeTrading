@@ -125,24 +125,30 @@ def _eval_one(
                     )
 
             # 收盘持仓快照: 由全历史成交净额还原 + 最新收盘价
+            #   卖出必须按均价结转成本, 否则"成本"会退化成"历史所有买入的平均价"
+            #   (与实盘 holdings_net 曾经踩的是同一类坑)。
             net: dict[str, dict[str, Any]] = {}
             for _, row in result.trades.iterrows():
                 c = str(row["code"])
                 side = str(row["side"])
                 units = int(row["units"])
                 price = float(row["price"])
-                e = net.setdefault(c, {"units": 0, "buy_cost": 0.0, "buy_units": 0})
+                e = net.setdefault(c, {"units": 0, "cost": 0.0})
                 if side == "BUY":
                     e["units"] += units
-                    e["buy_cost"] += units * price
-                    e["buy_units"] += units
+                    e["cost"] += units * price
                 elif side == "SELL":
+                    if e["units"] > 0:
+                        sold = min(units, e["units"])
+                        e["cost"] -= (e["cost"] / e["units"]) * sold
                     e["units"] -= units
+                    if e["units"] <= 0:
+                        e["cost"] = 0.0
             last_close = float(bars["close"].iloc[-1])
             for c, e in net.items():
                 if e["units"] <= 0:
                     continue
-                avg_price = e["buy_cost"] / e["buy_units"] if e["buy_units"] else 0.0
+                avg_price = e["cost"] / e["units"] if e["units"] else 0.0
                 positions.append(
                     {
                         "code": c,
