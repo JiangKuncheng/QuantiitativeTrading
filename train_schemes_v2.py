@@ -147,6 +147,10 @@ def train_one_scheme(
     coarse = coarse_subset(pool, coarse_n)
     folds = split_folds(*TRAIN, N_FOLDS)
     liq = liquidity_rank(market, pool) if select_by == "liquidity" else None
+    if liq is not None:
+        # 按流动性选股时, 粗筛子样本必须就是"流动性前 N 名", 否则粗筛阶段的组合
+        # 与最终组合不是一回事(随机子样本里只剩几只流动性票), 分数没有可比性
+        coarse = liq[:coarse_n]
     print(
         f"\n===== {MARKET_NAMES[market]}-{MODE_NAMES[mode]} ====="
         f"\n  池 {len(pool)} 只 | 粗筛子样本 {len(coarse)} 只 | train 折 {folds}"
