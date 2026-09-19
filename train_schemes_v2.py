@@ -163,7 +163,7 @@ def train_one_scheme(
             if tuner is None:
                 proposal = sanitize({"fast": 5, "slow": 25}, market, mode)
             else:
-            proposal = sanitize(tuner.propose(history), market, mode)
+                proposal = sanitize(tuner.propose(history), market, mode)
             if top_k_fixed is not None:
                 # 按流动性选股时, 宽度由 --top-k 指定(实测 30 只最优)
                 proposal["top_k"] = int(top_k_fixed)
