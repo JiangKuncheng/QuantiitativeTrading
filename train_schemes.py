@@ -308,6 +308,9 @@ def main() -> int:
     summary_rows = []
     for s in schemes:
         chart_scheme(s)
+        # 每个方案必须取自己的最优解: 这里原先复用了上一个循环残留的 b,
+        # 导致总报告里六行参数/绩效完全相同(每个方案的 json 本身是对的)。
+        b = s["best"]
         summary_rows.append(
             {
                 "方案": f"{MARKET_NAMES[s['market']]}-{MODE_NAMES[s['mode']]}",
