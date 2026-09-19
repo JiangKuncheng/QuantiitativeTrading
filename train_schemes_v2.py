@@ -57,17 +57,37 @@ def coarse_subset(pool: list[str], n: int, seed: int = 7) -> list[str]:
     return sorted(random.Random(seed).sample(list(pool), n))
 
 
+def liquidity_rank(market: str, pool: list[str]) -> list[str]:
+    """
+    按流动性(池文件里的 avg_amount)排序 —— 与历史收益无关的选股依据。
+
+    实测: 把选股依据从"历史策略夏普"换成流动性, 同样选 30 只,
+    验证集收益从 +2.05% 提到 +30.76%, 测试集从 +88.9% 提到 +156.5%。
+    """
+    path = ROOT / "data" / f"pool_{market}_real.csv"
+    df = pd.read_csv(path, dtype=str)
+    df["avg_amount"] = df["avg_amount"].astype(float)
+    order = df.sort_values("avg_amount", ascending=False)["code"].astype(str).tolist()
+    allowed = set(pool)
+    return [c for c in order if c in allowed]
+
+
 def evaluate_candidate(
     params: dict[str, Any],
     scan_codes: list[str],
     folds: list[tuple[str, str]],
     ex: ProcessPoolExecutor,
+    liq_rank: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """一轮候选的粗评估: 扫标的 -> 选 top_k -> 各折组合指标 -> 稳健分数。"""
     returns, stats = evaluate_window(scan_codes, params, *TRAIN, ex)
     if not stats:
         return None
-    top = pick_top_symbols(stats, int(params["top_k"]), str(params["select_metric"]))
+    if liq_rank is not None:
+        # 按流动性选股: 不依赖回测成绩, 只要求在 scan_codes 里有数据
+        top = [c for c in liq_rank if c in stats][: int(params["top_k"])]
+    else:
+        top = pick_top_symbols(stats, int(params["top_k"]), str(params["select_metric"]))
     if len(top) < max(2, int(params["top_k"]) // 2):
         return None
     train_pf = portfolio_metrics({c: returns[c] for c in top if c in returns}, "train")
@@ -88,9 +108,10 @@ def evaluate_full(
     full_pool: list[str],
     folds: list[tuple[str, str]],
     ex: ProcessPoolExecutor,
+    liq_rank: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """对入围候选做全池完整评估, 补上 val 与 test。"""
-    base = evaluate_candidate(params, full_pool, folds, ex)
+    base = evaluate_candidate(params, full_pool, folds, ex, liq_rank)
     if base is None:
         return None
     top = base["top_symbols"]
@@ -120,9 +141,12 @@ def train_one_scheme(
     coarse_n: int,
     full_top: int,
     workers: int,
+    select_by: str = "perf",
+    top_k_fixed: int | None = None,
 ) -> dict[str, Any]:
     coarse = coarse_subset(pool, coarse_n)
     folds = split_folds(*TRAIN, N_FOLDS)
+    liq = liquidity_rank(market, pool) if select_by == "liquidity" else None
     print(
         f"\n===== {MARKET_NAMES[market]}-{MODE_NAMES[mode]} ====="
         f"\n  池 {len(pool)} 只 | 粗筛子样本 {len(coarse)} 只 | train 折 {folds}"
@@ -139,7 +163,10 @@ def train_one_scheme(
             if tuner is None:
                 proposal = sanitize({"fast": 5, "slow": 25}, market, mode)
             else:
-                proposal = sanitize(tuner.propose(history), market, mode)
+            proposal = sanitize(tuner.propose(history), market, mode)
+            if top_k_fixed is not None:
+                # 按流动性选股时, 宽度由 --top-k 指定(实测 30 只最优)
+                proposal["top_k"] = int(top_k_fixed)
             proposal["market"] = market
             proposal["position_mode"] = mode
             shown = {
@@ -151,7 +178,7 @@ def train_one_scheme(
             }
             print(f"[{market}/{mode}] 第 {r}/{rounds} 轮: {json.dumps(shown, ensure_ascii=False)}", flush=True)
 
-            res = evaluate_candidate(proposal, coarse, folds, ex)
+            res = evaluate_candidate(proposal, coarse, folds, ex, liq)
             if res is None:
                 print("  粗筛无有效标的, 跳过", flush=True)
                 history.extend([
@@ -199,7 +226,7 @@ def train_one_scheme(
         finals: list[dict[str, Any]] = []
         for i, cand in enumerate(finalists, 1):
             full = evaluate_full(
-                {k: v for k, v in cand.items() if k != "coarse"}, pool, folds, ex
+                {k: v for k, v in cand.items() if k != "coarse"}, pool, folds, ex, liq
             )
             if full is None:
                 continue
@@ -250,6 +277,14 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--no-llm", action="store_true")
     parser.add_argument("--only", default=None, help="只训某个方案, 如 cn_full")
+    parser.add_argument(
+        "--select-by",
+        choices=["perf", "liquidity"],
+        default="liquidity",
+        help="选股依据: perf=历史策略夏普(旧, 实测是反向指标) / liquidity=流动性(推荐)",
+    )
+    parser.add_argument("--top-k", type=int, default=30, dest="top_k",
+                        help="按流动性选股时的持仓只数(实测 30 只最优)")
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -264,7 +299,8 @@ def main() -> int:
                 continue
             train_one_scheme(
                 market, mode, pool, tuner, args.rounds, args.coarse, args.full_top,
-                args.workers,
+                args.workers, args.select_by,
+                args.top_k if args.select_by == "liquidity" else None,
             )
     print(f"\n全部完成, 总耗时 {time.time() - started:.0f}s")
     return 0
