@@ -92,6 +92,7 @@ class BacktestEngine:
         pending_target: float | None = None  # 上一根K线收盘产生的目标仓位
         halted = False                     # 回撤熔断: 触发后停止开新仓并清仓
         halt_since_i: int | None = None    # 熔断触发时的K线序号(用于冷却期计算)
+        peak_equity = 0.0                  # 回撤基准: 熔断时重置到触发时的权益
         prev_close: float | None = None    # 上一根K线收盘价(限价单基准)
         last_target_fraction: float | None = None  # 最近一次实际执行的目标比例(避免无变化时重复调仓)
         for i, ts in enumerate(bars.index):
@@ -102,24 +103,31 @@ class BacktestEngine:
             low_price = float(bar["low"])
 
             # 0) 止损/止盈检查(先于新信号, 用当日最高/最低近似触发)
-            self._check_stops(account, code, ts, high_price, low_price)
+            if self._check_stops(account, code, ts, high_price, low_price):
+                # 止损/止盈平仓后仓位已经归零, 必须同步 last_target_fraction,
+                # 否则策略继续给出多头信号时, 引擎会以为"仍持有多头"而拒绝建仓
+                # (实测: 688072 在 2026-05-11 止盈后空仓近 3 个月)。
+                last_target_fraction = 0.0
 
             # 0.5) 回撤熔断: 权益回撤超限后清仓并停止开新仓
             if halted:
                 self._close_all(account, code, open_price, ts, reason="halt")
-                # 冷却期结束且回撤恢复到阈值以内 -> 解除熔断, 允许重新建仓
+                # 冷却期结束即解除熔断, 之后由策略信号决定何时重新建仓。
+                #
+                # 不能用"账户回撤恢复"作解除条件: 熔断后账户天天清仓, 100% 现金,
+                # 权益被冻结 => 回撤永远停在触发时的水平(≤ -max_drawdown_halt)。
+                # 而解除要求 dd > -halt_resume_drawdown。只要
+                # 0 < halt_resume_drawdown < max_drawdown_halt(实盘与六方案都是
+                # 0.1 < 0.2), 该条件恒为假 -> 永久熔断、永久空仓。
+                # 实盘 cn_full 方案 5 个子账户里 4 个就是这样死掉的。
                 cooldown = self.config.halt_cooldown_days
                 if halt_since_i is not None and (i - halt_since_i) >= cooldown:
-                    eq = pd.Series([r["equity"] for r in account.equity_curve])
-                    dd = float(eq.iloc[-1] / eq.cummax().iloc[-1] - 1.0)
-                    resume_limit = self.config.halt_resume_drawdown
-                    if resume_limit <= 0 or dd > -abs(resume_limit):
-                        halted = False
-                        halt_since_i = None
-                        print(
-                            f"[Backtest] {ts.date()} 熔断恢复"
-                            f"(冷却 {cooldown} 日, 当前回撤 {dd:.2%}), 允许重新建仓"
-                        )
+                    halted = False
+                    halt_since_i = None
+                    print(
+                        f"[Backtest] {ts.date()} 熔断解除"
+                        f"(冷却 {cooldown} 个交易日), 恢复按策略信号建仓"
+                    )
 
             # 1) 撮合昨日收盘信号: 以今日开盘价成交(延迟 1 根K线)
             if pending_target is not None and self._is_rebalance_day(ts, i, bars.index):
@@ -139,13 +147,20 @@ class BacktestEngine:
             account.mark_to_market(ts, {code: close_price})
 
             # 4) 回撤熔断检测
-            if not halted and self.config.max_drawdown_halt > 0:
+            if self.config.max_drawdown_halt > 0:
                 eq = pd.Series([r["equity"] for r in account.equity_curve])
-                dd = float(eq.iloc[-1] / eq.cummax().iloc[-1] - 1.0)
-                if dd <= -abs(self.config.max_drawdown_halt):
+                current_equity = float(eq.iloc[-1])
+                peak_equity = max(peak_equity, current_equity)
+                dd = (
+                    current_equity / peak_equity - 1.0 if peak_equity > 0 else 0.0
+                )
+                if not halted and dd <= -abs(self.config.max_drawdown_halt):
                     halted = True
                     halt_since_i = i
                     last_target_fraction = 0.0
+                    # 回撤基准重置到熔断时的权益: 熔断后账户清仓、权益冻结, 若仍拿
+                    # 旧峰值算回撤, 冷却期满刚恢复就会立刻再次触发 -> 死循环。
+                    peak_equity = current_equity
                     print(
                         f"[Backtest] {ts.date()} 触发回撤熔断: {dd:.2%}, "
                         f"清仓并暂停开仓(冷却 {self.config.halt_cooldown_days} 日)"
@@ -256,31 +271,37 @@ class BacktestEngine:
         ts: pd.Timestamp,
         high: float,
         low: float,
-    ) -> None:
-        """止损/止盈: 用当日 high/low 与持仓成本价比较, 触发即按触发价平仓。"""
+    ) -> bool:
+        """止损/止盈: 用当日 high/low 与持仓成本价比较, 触发即按触发价平仓。
+
+        返回是否真的平了仓 —— 调用方据此把 last_target_fraction 归零。
+        """
         pos = account.positions.get(code)
         if pos is None:
-            return
+            return False
         sl = self.config.stop_loss_pct
         tp = self.config.take_profit_pct
         if sl <= 0 and tp <= 0:
-            return
+            return False
         if pos.side == "long":
             stop_price = pos.avg_cost * (1 - sl) if sl > 0 else None
             take_price = pos.avg_cost * (1 + tp) if tp > 0 else None
             if take_price is not None and high >= take_price:
                 account.close_long(code, pos.units, take_price, ts)
-                return
+                return True
             if stop_price is not None and low <= stop_price:
                 account.close_long(code, pos.units, stop_price, ts)
+                return True
         elif pos.side == "short":
             stop_price = pos.avg_cost * (1 + sl) if sl > 0 else None
             take_price = pos.avg_cost * (1 - tp) if tp > 0 else None
             if take_price is not None and low <= take_price:
                 account.close_short(code, pos.units, take_price, ts)
-                return
+                return True
             if stop_price is not None and high >= stop_price:
                 account.close_short(code, pos.units, stop_price, ts)
+                return True
+        return False
 
     def _is_rebalance_day(self, ts: pd.Timestamp, i: int, index) -> bool:
         """调仓周期: daily 每天 / weekly 每周首个交易日 / monthly 每月首个交易日。"""
@@ -293,16 +314,17 @@ class BacktestEngine:
 
     def _close_all(
         self, account: Account, code: str, price: float, ts: pd.Timestamp, reason: str = "signal"
-    ) -> None:
-        """清仓该标的所有持仓。"""
+    ) -> bool:
+        """清仓该标的所有持仓, 返回是否真的清了仓。"""
         pos = account.positions.get(code)
         if pos is None:
-            return
+            return False
         sell_price = self._exec_price(price, is_buy=False)
         if pos.side == "long":
             account.close_long(code, pos.units, sell_price, ts)
         else:
             account.close_short(code, pos.units, sell_price, ts)
+        return True
 
     def _sizing(self, account: Account, price: float) -> int:
         """

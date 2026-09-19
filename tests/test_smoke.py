@@ -5,14 +5,17 @@
     python -m unittest discover -s tests -v
 """
 
+import json
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+import qtcore.daily_trader as dt_module
 from qtcore.backtest.engine import BacktestEngine
 from qtcore.config import AppConfig
 from qtcore.datacenter.data_center import DataCenter
@@ -337,6 +340,198 @@ class BuyBudgetTest(unittest.TestCase):
         )
         # 现金仅剩 20 万, 低于单票上限 40 万
         self.assertAlmostEqual(budgets["000001"], 200_000.0 / 1.0003, places=1)
+
+
+class HaltRecoveryTest(unittest.TestCase):
+    """
+    熔断必须能被解除。
+
+    旧逻辑用"账户回撤恢复到阈值内"当解除条件, 但熔断后账户天天清仓、100% 现金,
+    权益被冻结 => 回撤永远停在触发时的水平, 条件恒不可满足 => 永久熔断。
+    """
+
+    @staticmethod
+    def _crash_bars() -> pd.DataFrame:
+        closes: list[float] = []
+        price = 100.0
+        for _ in range(30):      # 上涨段: 建仓并创出权益峰值
+            price *= 1.01
+            closes.append(price)
+        price *= 0.75            # 单日暴跌 25%: 95% 仓位 -> 权益回撤约 23.8%
+        closes.append(price)
+        for _ in range(60):      # 反弹段: 策略信号应重新转多
+            price *= 1.01
+            closes.append(price)
+        index = pd.bdate_range("2024-01-01", periods=len(closes))
+        bars = pd.DataFrame(
+            {
+                "open": closes,
+                "high": closes,
+                "low": closes,
+                "close": closes,
+                "volume": [1_000_000.0] * len(closes),
+            },
+            index=index,
+        )
+        bars.attrs["code"] = "TEST"
+        return bars
+
+    def test_halt_releases_and_account_reenters(self) -> None:
+        bt = replace(
+            AppConfig().backtest,
+            initial_capital=1_000_000.0,
+            position_ratio=0.95,
+            max_position_ratio=1.0,
+            max_drawdown_halt=0.2,
+            halt_cooldown_days=5,
+            halt_resume_drawdown=0.1,
+        )
+        result = BacktestEngine(bt).run(
+            self._crash_bars(), create_strategy("ma_cross", {"fast": 2, "slow": 5})
+        )
+        equity = result.equity_curve["equity"]
+        drawdown = equity / equity.cummax() - 1.0
+        self.assertLessEqual(float(drawdown.min()), -0.2, "构造的数据应触发回撤熔断")
+
+        halt_day = drawdown[drawdown <= -0.2].index[0]
+        after = result.trades[
+            pd.to_datetime(result.trades["datetime"]) > halt_day
+        ]
+        self.assertGreater(
+            len(after[after["side"] == "BUY"]),
+            0,
+            "熔断冷却期过后应能重新建仓(旧逻辑会永久锁死)",
+        )
+
+
+class StopExitReentryTest(unittest.TestCase):
+    """
+    止损/止盈平仓后必须能重新建仓。
+
+    旧逻辑: _check_stops 平仓后没有同步 last_target_fraction, 引擎仍认为"已满仓多头",
+    策略继续给多头信号也不再建仓 —— 实测 688072 在止盈后空仓近 3 个月。
+    """
+
+    def test_take_profit_exit_reenters_while_signal_stays_long(self) -> None:
+        closes: list[float] = []
+        price = 100.0
+        for _ in range(60):      # 单边上涨: 策略始终多头, 且会反复触发止盈
+            price *= 1.015
+            closes.append(price)
+        index = pd.bdate_range("2024-01-01", periods=len(closes))
+        bars = pd.DataFrame(
+            {
+                "open": closes,
+                "high": closes,
+                "low": closes,
+                "close": closes,
+                "volume": [1_000_000.0] * len(closes),
+            },
+            index=index,
+        )
+        bars.attrs["code"] = "TEST"
+
+        bt = replace(
+            AppConfig().backtest,
+            initial_capital=1_000_000.0,
+            position_ratio=0.95,
+            max_position_ratio=1.0,
+            stop_loss_pct=0.0,
+            take_profit_pct=0.25,
+            max_drawdown_halt=0.0,
+        )
+        result = BacktestEngine(bt).run(
+            bars, create_strategy("ma_cross", {"fast": 2, "slow": 5})
+        )
+        trades = result.trades
+        sells = trades[trades["side"] == "SELL"]
+        buys = trades[trades["side"] == "BUY"]
+        self.assertGreaterEqual(len(sells), 1, "单边上涨应触发止盈平仓")
+
+        first_sell = pd.to_datetime(sells["datetime"]).min()
+        reentries = buys[pd.to_datetime(buys["datetime"]) > first_sell]
+        self.assertGreater(
+            len(reentries), 0, "止盈平仓后信号仍为多头时必须重新建仓"
+        )
+
+
+class AccountHaltTest(unittest.TestCase):
+    """实盘账户层熔断: 冷却期满必须解除, 不能因为空仓而永久锁死。"""
+
+    PARAMS = {
+        "max_drawdown_halt": 0.2,
+        "halt_cooldown_days": 5,
+        "halt_resume_drawdown": 0.1,
+    }
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.halt_path = Path(self.tmp.name) / "halt_state.json"
+        self._original_halt_path = dt_module.HALT_STATE_PATH
+        dt_module.HALT_STATE_PATH = self.halt_path
+        self.addCleanup(
+            lambda: setattr(dt_module, "HALT_STATE_PATH", self._original_halt_path)
+        )
+
+        self.trader = DailyTrader.__new__(DailyTrader)
+        self.trader.cfg = {"initial_capital": 1_000_000, "account_start": "20260810"}
+        self.trader.store = Store(Path(self.tmp.name) / "trading.db")
+        self.addCleanup(self.trader.store.close)
+        self.trader._calendar = set()  # 无交易日历 -> 回退到"周一至周五"
+
+    def _equity(self, day: str, value: float) -> None:
+        self.trader.store.save_equity(
+            {
+                "date": day,
+                "equity": value,
+                "cash": value,
+                "position_value": 0.0,
+                "daily_return": 0.0,
+                "benchmark_return": 0.0,
+                "strategy_total": value / 1_000_000 - 1.0,
+                "benchmark_total": 0.0,
+            }
+        )
+
+    def test_halt_triggers_then_releases_after_cooldown(self) -> None:
+        self._equity("2026-08-10", 1_000_000.0)
+        self._equity("2026-08-11", 780_000.0)  # -22% -> 触发熔断
+        self.assertTrue(
+            self.trader._account_halt_check(
+                date(2026, 8, 11), "2026-08-11", self.PARAMS
+            )
+        )
+        self.assertTrue(self.halt_path.exists(), "应写入熔断状态文件")
+
+        # 冷却期内: 仍然熔断(次日计划清仓)
+        self.assertTrue(
+            self.trader._account_halt_check(
+                date(2026, 8, 12), "2026-08-12", self.PARAMS
+            )
+        )
+
+        # 空仓期间权益不变, 冷却期满(5 个交易日后 = 08-18) 必须解除
+        self._equity("2026-08-18", 780_000.0)
+        self.assertFalse(
+            self.trader._account_halt_check(
+                date(2026, 8, 18), "2026-08-18", self.PARAMS
+            ),
+            "冷却期满应解除熔断(旧逻辑会因空仓永远锁死)",
+        )
+        self.assertTrue(self.halt_path.exists(), "解除后保留状态文件以携带新的回撤基准")
+        self.assertFalse(
+            json.loads(self.halt_path.read_text(encoding="utf-8"))["halted"]
+        )
+
+        # 关键回归: 解除后的第二天不能因为旧峰值而立刻再次熔断(否则就是死循环)
+        self._equity("2026-08-19", 780_000.0)
+        self.assertFalse(
+            self.trader._account_halt_check(
+                date(2026, 8, 19), "2026-08-19", self.PARAMS
+            ),
+            "解除后不应立刻再次触发熔断",
+        )
 
 
 if __name__ == "__main__":

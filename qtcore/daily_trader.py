@@ -694,6 +694,12 @@ class DailyTrader:
         """
         账户层熔断状态机: 用"建仓以来"的账户权益链计算回撤,
         触发 -> 冷却 -> 恢复, 状态存 data/halt_state.json。
+
+        恢复只看冷却期, 不看回撤 —— 不能拿"账户回撤恢复"当解除条件:
+        熔断后次日就清仓, 账户 100% 现金、权益被冻结, 回撤永远停在触发时的
+        水平(≤ -max_drawdown_halt), 而解除要求 dd > -halt_resume_drawdown;
+        只要 0 < halt_resume_drawdown < max_drawdown_halt 该条件恒为假,
+        账户将永久空仓。halt_resume_drawdown 因此不再作为硬性门槛。
         """
         halt_limit = float(params.get("max_drawdown_halt", 0.0))
         resume_limit = float(params.get("halt_resume_drawdown", 0.0))
@@ -707,8 +713,6 @@ class DailyTrader:
         if len(eq_rows) < 2:
             return False
         eqs = [r["equity"] for r in eq_rows]
-        peak = max(eqs)
-        dd = eqs[-1] / peak - 1.0 if peak > 0 else 0.0
 
         state: dict[str, Any] = {}
         if HALT_STATE_PATH.exists():
@@ -717,14 +721,35 @@ class DailyTrader:
             except Exception:
                 state = {}
 
+        # 回撤基准: 一旦熔断过就固定到"熔断触发时的权益"(peak_base), 否则用建仓以来最高权益。
+        # 若始终拿旧峰值算回撤, 空仓冻结的账户会永远低于触发线, 冷却期满刚恢复就再次
+        # 触发 —— 死循环。所以熔断时把基准下移, 冷静期结束后从新起点重新计回撤。
+        base = float(state.get("peak_base") or 0.0)
+        peak = base if base > 0 else max(eqs)
+        dd = eqs[-1] / peak - 1.0 if peak > 0 else 0.0
+
         if state.get("halted"):
             cooldown_until = str(state.get("cooldown_until", ""))
-            recovered = resume_limit <= 0 or dd > -abs(resume_limit)
-            if d_iso >= cooldown_until and recovered:
-                HALT_STATE_PATH.unlink(missing_ok=True)
-                print(f"[Daily] {d_iso} 账户熔断解除(回撤 {dd:.2%} 回到阈值内)")
+            if d_iso >= cooldown_until:
+                # 保留状态文件: 只把 halted 置回 False, peak_base 继续沿用
+                HALT_STATE_PATH.write_text(
+                    json.dumps(
+                        {
+                            "halted": False,
+                            "released_on": d_iso,
+                            "peak_base": round(base, 2),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                print(f"[Daily] {d_iso} 账户熔断解除(冷却期满), 恢复按策略信号建仓")
                 return False
-            print(f"[Daily] {d_iso} 账户熔断中(回撤 {dd:.2%}, 冷却至 {cooldown_until}), 次日计划=清仓")
+            print(
+                f"[Daily] {d_iso} 账户熔断中(回撤 {dd:.2%}, 冷却至 {cooldown_until}), "
+                f"次日计划=清仓"
+            )
             return True
 
         if dd <= -abs(halt_limit):
@@ -741,6 +766,7 @@ class DailyTrader:
                         "halted_since": d_iso,
                         "cooldown_until": cooldown_until,
                         "drawdown": round(dd, 6),
+                        "peak_base": round(eqs[-1], 2),
                     },
                     ensure_ascii=False,
                     indent=2,
