@@ -148,6 +148,21 @@ class Store:
         )
         self.conn.commit()
 
+    def update_equity_account(self, date: str, cash: float, position_value: float) -> None:
+        """
+        回填当日"账户口径"的现金与持仓市值。
+
+        权益链(equity)是按"昨日权益 x 当日组合收益"滚出来的策略口径, 与现金/持仓无关;
+        这里落库的是账户实际口径, 两者互为对照, 用于发现"持仓突破本金"这类脱节。
+        现金必须落库: 历史上它一直是 NULL, 导致买入预算只能按权益比例估算,
+        算错了也没有任何数据可以用来校验。
+        """
+        self.conn.execute(
+            "UPDATE equity_daily SET cash = ?, position_value = ? WHERE date = ?",
+            (float(cash), float(position_value), date),
+        )
+        self.conn.commit()
+
     def save_trades(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
@@ -347,19 +362,48 @@ class Store:
             "SELECT code, side, units, price FROM trades ORDER BY id"
         ):
             u = int(units)
+            px = float(price)
             if side in ("BUY", "SELL_SHORT"):
                 net[code] = net.get(code, 0) + u
-                cost[code] = cost.get(code, 0.0) + u * float(price)
+                cost[code] = cost.get(code, 0.0) + u * px
             else:
-                net[code] = net.get(code, 0) - u
+                # 卖出按均价结转成本: 否则部分卖出后剩余仓位成本会被高估
+                held = net.get(code, 0)
+                if held > 0:
+                    sold = min(u, held)
+                    cost[code] = cost.get(code, 0.0) - (cost.get(code, 0.0) / held) * sold
+                net[code] = held - u
+                if net[code] <= 0:
+                    cost[code] = 0.0
         out: dict[str, dict[str, Any]] = {}
         for code, units in net.items():
             if units > 0:
                 out[code] = {
                     "units": units,
                     "avg_cost": round(cost.get(code, 0.0) / units, 4),
+                    "cost_basis": round(cost.get(code, 0.0), 4),
                 }
         return out
+
+    def cash_net(self, initial_capital: float) -> float:
+        """
+        按成交记录推算当前可用现金(账户口径)。
+
+        账户现金没有单独落库, 只能由成交流水回放得到:
+            现金 = 初始本金 - 买入总额 - 佣金 + 卖出总额 - 佣金
+        买入预算必须先看这个值, 否则会出现"钱不够还照买"的越界成交。
+        """
+        cash = float(initial_capital)
+        for side, units, price, commission in self.conn.execute(
+            "SELECT side, units, price, commission FROM trades ORDER BY id"
+        ):
+            gross = int(units) * float(price)
+            comm = float(commission or 0.0)
+            if side in ("BUY", "SELL_SHORT"):
+                cash -= gross + comm
+            else:
+                cash += gross - comm
+        return cash
 
     def save_state(
         self,

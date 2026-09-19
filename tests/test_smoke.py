@@ -16,8 +16,10 @@ import pandas as pd
 from qtcore.backtest.engine import BacktestEngine
 from qtcore.config import AppConfig
 from qtcore.datacenter.data_center import DataCenter
+from qtcore.daily_trader import DailyTrader
 from qtcore.main_manager import MainManager
 from qtcore.screener import StockScreener
+from qtcore.store import Store
 from qtcore.strategy import create_strategy
 from qtcore.trainer import (
     TrainingConfig,
@@ -169,6 +171,90 @@ class PipelineSmokeTest(unittest.TestCase):
         self.assertIn("excess_total_return", cmp)
         self.assertIn("beta", cmp)
         self.assertIn("up_capture", cmp)
+
+
+class AccountReconcileTest(unittest.TestCase):
+    """账户口径对账: 现金 + 持仓市值 落库, 并与策略权益链比对告警。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "trading.db"
+        # 只覆盖对账逻辑: DailyTrader.__init__ 需要邮件配置(.env), 这里手工装配
+        # store 与 cfg, 避免测试依赖线上密钥。
+        self.trader = DailyTrader.__new__(DailyTrader)
+        self.trader.cfg = {"initial_capital": 1_000_000}
+        self.trader.store = Store(self.db)
+        # Windows 上必须显式关闭 SQLite 连接, 否则临时目录删不掉
+        self.addCleanup(self.trader.store.close)
+        self.trader.store.save_equity(
+            {
+                "date": "2026-09-18",
+                "equity": 1_000_000.0,
+                "cash": None,
+                "position_value": None,
+                "daily_return": 0.0,
+                "benchmark_return": 0.0,
+                "strategy_total": 0.0,
+                "benchmark_total": 0.0,
+            }
+        )
+        # 买入 1,000 股 @200, 佣金 60 -> 现金 799,940
+        self.trader.store.save_trades(
+            [
+                {
+                    "date": "2026-09-18",
+                    "code": "000001",
+                    "name": "测试标的",
+                    "side": "BUY",
+                    "units": 1000,
+                    "price": 200.0,
+                    "commission": 60.0,
+                    "pnl": None,
+                    "reason": "open_long",
+                }
+            ]
+        )
+
+    def _last_status(self) -> tuple[str, str]:
+        row = self.trader.store.conn.execute(
+            "SELECT status, detail FROM run_log WHERE stage = 'reconcile'"
+            " ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return row["status"], row["detail"]
+
+    def test_reconcile_ok_persists_cash_and_position(self) -> None:
+        holdings = {"000001": {"units": 1000, "value": 200_000.0}}
+        out = self.trader._reconcile_account(
+            "2026-09-18", 1_000_000.0, holdings, {"max_position_ratio": 1.0}
+        )
+        self.assertAlmostEqual(out["cash"], 799_940.0, places=2)
+        self.assertAlmostEqual(out["position_value"], 200_000.0, places=2)
+        self.assertAlmostEqual(out["account_equity"], 999_940.0, places=2)
+
+        row = self.trader.store.conn.execute(
+            "SELECT cash, position_value FROM equity_daily WHERE date = '2026-09-18'"
+        ).fetchone()
+        self.assertAlmostEqual(row["cash"], 799_940.0, places=2)
+        self.assertAlmostEqual(row["position_value"], 200_000.0, places=2)
+        self.assertEqual(self._last_status()[0], "ok")
+
+    def test_reconcile_flags_position_over_capital(self) -> None:
+        """持仓市值突破本金必须报 error —— 这正是历史 bug 的形态。"""
+        holdings = {"000001": {"units": 1000, "value": 1_500_000.0}}
+        self.trader._reconcile_account(
+            "2026-09-18", 1_000_000.0, holdings, {"max_position_ratio": 1.0}
+        )
+        status, detail = self._last_status()
+        self.assertEqual(status, "error")
+        self.assertIn("超过上限", detail)
+
+    def test_reconcile_warns_on_large_drift(self) -> None:
+        holdings = {"000001": {"units": 1000, "value": 200_000.0}}
+        self.trader._reconcile_account(
+            "2026-09-18", 1_500_000.0, holdings, {"max_position_ratio": 1.0}
+        )
+        self.assertEqual(self._last_status()[0], "warn")
 
 
 if __name__ == "__main__":

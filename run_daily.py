@@ -28,8 +28,10 @@ def main() -> int:
     parser.add_argument("--today", action="store_true", help="运行今天完整流程")
     parser.add_argument("--settle", action="store_true", help="16:00 结算+日报+生成明日计划")
     parser.add_argument("--execute", action="store_true", help="9:20 执行当日计划(实时成交)")
-    parser.add_argument("--retries", type=int, default=5, help="开盘价获取失败后的重试次数(默认5)")
-    parser.add_argument("--retry-interval", type=int, default=10, help="重试间隔分钟(默认10)")
+    # 默认重试窗口 9:20 + 10×8min ≈ 10:40: 必须越过 10:30, 因为兜底数据源(新浪60分钟)
+    # 的当日第一根 bar 到 10:30 才生成; 早先窗口 10:10 结束, 导致开盘价永远取不到。
+    parser.add_argument("--retries", type=int, default=10, help="开盘价获取失败后的重试次数(默认10)")
+    parser.add_argument("--retry-interval", type=int, default=8, help="重试间隔分钟(默认8)")
     parser.add_argument("--settle-retries", type=int, default=20,
                         help="结算时当日行情未发布的最大等待重试次数(默认20)")
     parser.add_argument("--settle-retry-interval", type=int, default=15,
