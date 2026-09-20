@@ -57,18 +57,25 @@ def coarse_subset(pool: list[str], n: int, seed: int = 7) -> list[str]:
     return sorted(random.Random(seed).sample(list(pool), n))
 
 
-def liquidity_rank(market: str, pool: list[str]) -> list[str]:
+def liquidity_rank(
+    market: str, pool: list[str], tradable: set[str] | None = None
+) -> list[str]:
     """
     按流动性(池文件里的 avg_amount)排序 —— 与历史收益无关的选股依据。
 
     实测: 把选股依据从"历史策略夏普"换成流动性, 同样选 30 只,
     验证集收益从 +2.05% 提到 +30.76%, 测试集从 +88.9% 提到 +156.5%。
+
+    tradable: 训练窗口有数据的标的集合。**必须先过滤再排序** ——
+    美股/港股池里流动性最高的往往是次新股, 它们在 2020-2022 没有数据,
+    若不过滤, 选出的前 N 名大半不可用, 候选会被整批判为无效(us_full 实测
+    20 轮全部无效直接崩溃)。
     """
     path = ROOT / "data" / f"pool_{market}_real.csv"
     df = pd.read_csv(path, dtype=str)
     df["avg_amount"] = df["avg_amount"].astype(float)
     order = df.sort_values("avg_amount", ascending=False)["code"].astype(str).tolist()
-    allowed = set(pool)
+    allowed = set(pool) if tradable is None else (set(pool) & tradable)
     return [c for c in order if c in allowed]
 
 
@@ -146,7 +153,20 @@ def train_one_scheme(
 ) -> dict[str, Any]:
     coarse = coarse_subset(pool, coarse_n)
     folds = split_folds(*TRAIN, N_FOLDS)
-    liq = liquidity_rank(market, pool) if select_by == "liquidity" else None
+    liq = None
+    if select_by == "liquidity":
+        # 先扫一遍池子, 确认哪些标的在训练窗口有数据(只为判断可用性, 参数无关)
+        probe_params = {"fast": 5, "slow": 25, "timeframe": "daily", "market": market,
+                        "position_mode": mode, "top_k": 1, "select_metric": "sharpe"}
+        with ProcessPoolExecutor(max_workers=workers) as probe_ex:
+            _, probe_stats = evaluate_window(pool, probe_params, *TRAIN, probe_ex)
+        tradable = set(probe_stats)
+        liq = liquidity_rank(market, pool, tradable)
+        print(
+            f"  训练窗口可用标的 {len(tradable)}/{len(pool)} 只, "
+            f"按流动性排序后取前 {coarse_n} 只做粗筛",
+            flush=True,
+        )
     if liq is not None:
         # 按流动性选股时, 粗筛子样本必须就是"流动性前 N 名", 否则粗筛阶段的组合
         # 与最终组合不是一回事(随机子样本里只剩几只流动性票), 分数没有可比性
