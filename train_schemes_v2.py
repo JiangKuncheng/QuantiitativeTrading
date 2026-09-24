@@ -294,6 +294,10 @@ def train_one_scheme(
     payload["position_mode"] = mode
     # score 用全池 walk-forward 稳健分数(粗筛分数只用于挑入围候选)
     payload["score"] = float(best.get("score", 0.0))
+    # top_symbols 必须写成逗号分隔的**字符串**: scheme_runner 读的是
+    # str(scheme["top_symbols"]).split(",")，写成 list 会被切成垃圾代码，
+    # 导致所有方案一只票都取不到行情(实测六个方案全部空转)。
+    payload["top_symbols"] = ",".join(str(c) for c in best.get("top_symbols", []))
     json_path = OUT_DIR / f"{market}_{mode}.json"
     json_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
